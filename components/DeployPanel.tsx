@@ -12,6 +12,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { checkArtifact, deployGuard, initializeGuard, planDeploy } from "../lib/guard/guardOps.ts";
+import {
+  getCachedHash,
+  getCachedByteLength,
+  setCachedHash,
+  invalidateCachedHash,
+} from "../lib/guard/bytecodeCache.ts";
 import { rememberDeployment } from "../lib/guard/setupChecklist.ts";
 import type { ArtifactCheck, DeployOutcome, DeployPlan } from "../lib/guard/guardOps.ts";
 import { deployCostBreakdown } from "../lib/guard/deployCostCalculator.ts";
@@ -541,6 +547,23 @@ export function DeployPanel() {
             <div className="stat">
               <div className="k">Fetched from chain</div>
               <div className="v small mono">{artifact.live.fetchedSha256.slice(0, 16)}...</div>
+              <div className="n">{artifact.live.bytes} bytes</div>
+            </div>
+            <div className="stat">
+              <div className="k">Cache</div>
+              <div
+                className="v small"
+                style={{
+                  color:
+                    artifact.live.fetchedSha256 === PHASE1_ARTIFACT.wasmHash
+                      ? "var(--ok)"
+                      : "var(--warn)",
+                }}
+              >
+                {artifact.live.fetchedSha256 === PHASE1_ARTIFACT.wasmHash
+                  ? "cache hit"
+                  : "cache miss"}
+              </div>
               <div className="n">{artifact.live.bytes} bytes</div>
             </div>
             <div className="stat">

@@ -11,7 +11,7 @@
  * compare.
  */
 
-import { policyToScVal } from "stellar-agent-guard-sdk";
+import { policyToScVal, validateGuardPolicy } from "stellar-agent-guard-sdk";
 import type { PolicyConfig } from "stellar-agent-guard-sdk";
 import { Address, xdr } from "@stellar/stellar-sdk";
 import { validateAssetCapOverrides, type AssetCapOverride } from "./assetCapsCsv.ts";
@@ -55,7 +55,7 @@ const MAX_POLICY_CAP = (1n << 127n) - 1n;
 const MAX_POLICY_SECONDS = (1n << 64n) - 1n;
 
 export interface FieldIssue {
-  field: keyof PolicyDraft;
+  field: string;
   message: string;
 }
 
@@ -124,6 +124,17 @@ function parseAddresses(
  * prompt, rather than reading a host error afterwards.
  */
 export function buildPolicyConfig(draft: PolicyDraft): ValidationResult {
+  // First, validate using the SDK's validateGuardPolicy which provides rule-level feedback
+  const sdkValidation = validateGuardPolicy(draft);
+  if (sdkValidation.length > 0) {
+    // Convert SDK validation failures to our FieldIssue format
+    const issues: FieldIssue[] = sdkValidation.map((fail) => ({
+      field: fail.path,
+      message: fail.message,
+    }));
+    return { ok: false, issues };
+  }
+
   const issues: FieldIssue[] = [];
 
   const perTxCap = parseCap(draft.perTxCap, "perTxCap", "Per-transaction cap", issues);

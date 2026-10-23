@@ -10,6 +10,8 @@
  * instance to read the pinned bytes from — and those default to public testnet.
  */
 
+import { GUARD_WASM_HASH } from "stellar-agent-guard-sdk";
+
 /**
  * The canonical public Stellar testnet: the defaults, and the network the pinned
  * artifact is published on.
@@ -62,7 +64,7 @@ export const TESTNET_ARTIFACT_SOURCE = "CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQ
 export const PHASE1_ARTIFACT = {
   guard: process.env.NEXT_PUBLIC_ARTIFACT_SOURCE_CONTRACT_ID ?? TESTNET_ARTIFACT_SOURCE,
   token: "CBLQLJAG72M4XQRJMQHSKYIFVHQD7LNTNOQH2GRMCMBWMSLBSLTGTJC7",
-  wasmHash: "f47919f92e78fdd034836aa61955fc338dd56a218c448c37df1867a8c3da0f63",
+  wasmHash: GUARD_WASM_HASH,
   wasmBytes: 39673,
 } as const;
 
