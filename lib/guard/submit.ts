@@ -454,6 +454,18 @@ async function pollForInclusion(
 }
 
 /**
+ * The outcome for a signature the operator declined (issue #291).
+ *
+ * Deliberately its own kind rather than a `refused`: nothing was simulated into
+ * a refusal and nothing was rejected by the network. The detail is the wallet's
+ * own words where it offered any, so no envelope, signature or payload is copied
+ * into it.
+ */
+function cancelledResult(error: unknown): InvokeResult {
+  return { kind: "cancelled", detail: actionableCancellationMessage(error) };
+}
+
+/**
  * The refusable result for a wallet interruption.
  *
  * Publishes the phase-specific guidance once, for the wallet panel, and returns
@@ -616,9 +628,16 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
       signedEntryXdr = await signer.signAuthEntry(entry.toXDR("base64"));
     } catch (error) {
       const interruption = interruptionFromSignerFailure(error, "authorization");
-      if (!interruption) throw error;
-      announce("Wallet interrupted during authorization signing — nothing was resubmitted");
-      return interruptedResult(interruption.interruption);
+      if (interruption) {
+        announce("Wallet interrupted during authorization signing — nothing was resubmitted");
+        return interruptedResult(interruption.interruption);
+      }
+      // A decline is the operator's decision, not a failure: it gets its own
+      // outcome so the panel can say "nothing was broadcast" and offer an
+      // explicit retry, instead of reporting a broadcast that never happened
+      // (issue #291).
+      if (isWalletCancellation(error)) return cancelledResult(error);
+      throw error;
     }
     signed.push(xdr.SorobanAuthorizationEntry.fromXDR(signedEntryXdr, "base64"));
   }
@@ -704,9 +723,15 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
     signedEnvelope = await signer.signTransaction(assembled.transaction.toXDR());
   } catch (error) {
     const interruption = interruptionFromSignerFailure(error, "envelope");
-    if (!interruption) throw error;
-    announce("Wallet interrupted during transaction signing — nothing was resubmitted");
-    return interruptedResult(interruption.interruption);
+    if (interruption) {
+      announce("Wallet interrupted during transaction signing — nothing was resubmitted");
+      return interruptedResult(interruption.interruption);
+    }
+    // Same at the envelope as at the authorization entry: the operator said no,
+    // so the write ends as a cancellation and never reaches the network
+    // (issue #291). Nothing is retried from here — the retry is theirs to ask for.
+    if (isWalletCancellation(error)) return cancelledResult(error);
+    throw error;
   }
 
   if (maxTime > 0 && detectExpiration(Math.floor(Date.now() / 1000), maxTime)) {
@@ -813,6 +838,10 @@ export async function invokeWithWallet(request: InvokeRequest): Promise<InvokeRe
     // may have landed.
     const guidance = recoveryGuidance(result.writeInterruption);
     announce(`${guidance.headline} ${guidance.nextStep}`, "assertive");
+  } else if (result.kind === "cancelled") {
+    // The operator's own decision, so the announcement says what did *not*
+    // happen and that nothing needs rescuing — no transaction exists to look up.
+    announce("Signing declined in the wallet — nothing was broadcast", "assertive");
   } else if (result.kind === "refused") {
     announce(`Transaction refused — nothing was broadcast ${context}`, "assertive");
   } else if (result.kind === "failed") {

@@ -11,11 +11,17 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { checkArtifact, deployGuard, initializeGuard, planDeploy } from "../lib/guard/guardOps.ts";
+import {
+  checkArtifact,
+  classifyDeploySteps,
+  deployGuard,
+  initializeGuard,
+  planDeploy,
+} from "../lib/guard/guardOps.ts";
 import { rememberDeployment } from "../lib/guard/setupChecklist.ts";
 import type { ArtifactCheck, DeployOutcome, DeployPlan } from "../lib/guard/guardOps.ts";
 import { deployCostBreakdown } from "../lib/guard/deployCostCalculator.ts";
-import type { InvokeResult } from "../lib/guard/submit.ts";
+import { isWalletCancellation, type InvokeResult } from "../lib/guard/submit.ts";
 import { NETWORK, PHASE1_ARTIFACT } from "../lib/guard/network.ts";
 import { fetchContractWasm, verifyWasmIdentity } from "../lib/guard/chain.ts";
 import { toHex } from "../lib/guard/scval.ts";
@@ -85,6 +91,130 @@ type PredictedInspection =
   | { address: string; state: "existing"; integrity: IntegrityReport | null; error: string | null }
   | { address: string; state: "error"; error: string };
 
+/** A thrown failure, kept with the action that produced it (#291). */
+type PanelFailure = {
+  source: "deploy" | "initialize";
+  detail: string;
+  /** True when the wallet declined the signature rather than something failing. */
+  cancelled: boolean;
+};
+
+/** How an outcome should be worded and toned (#291). */
+interface OutcomeView {
+  headline: string;
+  /** `warn` is a decision the operator made, `error` is something that went wrong. */
+  tone: "info" | "warn" | "error";
+  /** True only when nothing was broadcast, so an explicit retry is the next step. */
+  retryable: boolean;
+  /** The wallet's or the network's own words, when there are any worth showing. */
+  detail: string | null;
+}
+
+/**
+ * The deploy outcome's headline, decided from what actually reached the chain.
+ *
+ * Pure so the three cases the panel must never confuse are testable without a
+ * wallet: a decline (the operator said no — nothing was broadcast), a refusal
+ * (simulation or submission said no), and a create that landed but is not the
+ * pinned artifact. Before this, all three read as "a contract was created".
+ */
+export function deployOutcomeView(outcome: DeployOutcome): OutcomeView {
+  const progress = classifyDeploySteps(outcome.steps);
+  const partial = progress.kind !== "created" && progress.landed.length > 0;
+  switch (progress.kind) {
+    case "declined":
+      return {
+        headline: partial
+          ? "An earlier step landed, but the wallet declined the deploy before a contract was created"
+          : "Deploy declined in the wallet — nothing was broadcast",
+        tone: "warn",
+        retryable: true,
+        detail: progress.detail,
+      };
+    case "refused":
+      return {
+        headline: partial
+          ? "An earlier step landed, but the deploy was refused before the contract was created"
+          : "The deploy was refused before broadcast",
+        tone: "error",
+        retryable: false,
+        detail: progress.detail,
+      };
+    case "failed":
+      return {
+        headline: "The create transaction was included and rejected on chain",
+        tone: "error",
+        retryable: false,
+        detail: progress.detail,
+      };
+    default:
+      if (outcome.verified) {
+        return {
+          headline: "Deployed and verified against the pinned artifact",
+          tone: "info",
+          retryable: false,
+          detail: null,
+        };
+      }
+      return {
+        headline:
+          outcome.readError !== null
+            ? "A contract was created, but its bytecode could not be read back"
+            : "A contract was created, but it is NOT the pinned artifact",
+        tone: "error",
+        retryable: false,
+        detail: null,
+      };
+  }
+}
+
+/**
+ * The initialization outcome's headline (#291).
+ *
+ * A decline and an exported envelope are both "nothing was broadcast", and
+ * neither is an on-chain rejection — which is what this block used to claim
+ * about all three.
+ */
+export function initOutcomeView(result: InvokeResult): OutcomeView {
+  switch (result.kind) {
+    case "submitted":
+      return {
+        headline: "initialize landed on chain",
+        tone: "info",
+        retryable: false,
+        detail: null,
+      };
+    case "cancelled":
+      return {
+        headline: "initialize was declined in the wallet — nothing was broadcast",
+        tone: "warn",
+        retryable: true,
+        detail: result.detail,
+      };
+    case "refused":
+      return {
+        headline: "initialize was refused before broadcast",
+        tone: "error",
+        retryable: false,
+        detail: result.detail,
+      };
+    case "exported":
+      return {
+        headline: "initialize was exported for offline signing — nothing was broadcast",
+        tone: "warn",
+        retryable: false,
+        detail: result.detail ?? null,
+      };
+    default:
+      return {
+        headline: "initialize was broadcast and rejected on chain",
+        tone: "error",
+        retryable: false,
+        detail: result.detail,
+      };
+  }
+}
+
 // parked-until-upstream: #13
 // The multi-artifact version picker is blocked until the upstream stellar-agent-guard-contracts
 // repository lands its release-workflow and publishes its first versioned artifact, and the SDK
@@ -107,7 +237,7 @@ export function DeployPanel() {
   const [deploying, setDeploying] = useState(false);
   const [outcome, setOutcome] = useState<DeployOutcome | null>(null);
   const [liveSteps, setLiveSteps] = useState<string[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<PanelFailure | null>(null);
   const [agentPubkey, setAgentPubkey] = useState("");
   const [initResult, setInitResult] = useState<InvokeResult | null>(null);
 
@@ -498,6 +628,11 @@ export function DeployPanel() {
     // The worker will handle cancellation internally
   }
 
+  // The headline and tone for both outcomes are decided before render, from the
+  // results themselves, so a decline can never be worded as a broadcast failure.
+  const deployView = outcome === null ? null : deployOutcomeView(outcome);
+  const initView = initResult === null ? null : initOutcomeView(initResult);
+
   /**
    * The handoff record for the deploy on screen (#396).
    *
@@ -538,7 +673,7 @@ export function DeployPanel() {
 
   async function deploy() {
     setDeploying(true);
-    setError(null);
+    setFailure(null);
     setOutcome(null);
     setLiveSteps([]);
     try {
@@ -557,14 +692,21 @@ export function DeployPanel() {
       }
       await refresh();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      // A decline is not an error to blame the deploy for: it is classified here
+      // so a rejection that throws out of the write path still gets the explicit
+      // retry block rather than a generic failure banner (#291).
+      setFailure({
+        source: "deploy",
+        detail: caught instanceof Error ? caught.message : String(caught),
+        cancelled: isWalletCancellation(caught),
+      });
     } finally {
       setDeploying(false);
     }
   }
 
   async function initialize(target: string) {
-    setError(null);
+    setFailure(null);
     setInitResult(null);
     try {
       const result = await initializeGuard({
@@ -574,9 +716,13 @@ export function DeployPanel() {
         agentPubkeyHex: agentPubkey,
       });
       setInitResult(result);
-      await refresh();
+      if (result.kind !== "cancelled") await refresh();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setFailure({
+        source: "initialize",
+        detail: caught instanceof Error ? caught.message : String(caught),
+        cancelled: isWalletCancellation(caught),
+      });
     }
   }
 
@@ -966,22 +1112,69 @@ export function DeployPanel() {
         </div>
       )}
 
-      {error && (
-        <ErrorBlock title="The deploy could not be completed" detail={error} context="write" />
+      {failure?.cancelled && (
+        <DeclinedBlock
+          title={
+            failure.source === "deploy"
+              ? "The deploy was declined in your wallet"
+              : "The initialization was declined in your wallet"
+          }
+          detail={failure.detail}
+          retryLabel={failure.source === "deploy" ? "Retry deploy" : "Retry initialize"}
+          onRetry={() =>
+            failure.source === "deploy" ? void deploy() : void initialize(outcome?.guard ?? "")
+          }
+          disabled={
+            failure.source === "deploy"
+              ? deployControl.disabled
+              : !wallet || !agentPubkeyValid || !initValidation.canDeploy
+          }
+        />
+      )}
+      {failure && !failure.cancelled && (
+        <ErrorBlock
+          title={
+            failure.source === "deploy"
+              ? "The deploy could not be completed"
+              : "The initialization could not be completed"
+          }
+          detail={failure.detail}
+          context="write"
+        />
       )}
 
-      {outcome && (
-        <div className={outcome.verified ? "notice info" : "error"}>
-          <strong>
-            {outcome.verified
-              ? "Deployed and verified against the pinned artifact"
-              : outcome.readError !== null
-                ? "A contract was created, but its bytecode could not be read back"
-                : "A contract was created, but it is NOT the pinned artifact"}
-          </strong>
+      {outcome && deployView && (
+        <div
+          className={
+            deployView.tone === "info"
+              ? "notice info"
+              : deployView.tone === "warn"
+                ? "warn notice"
+                : "error"
+          }
+          data-testid="deploy-outcome"
+        >
+          <strong>{deployView.headline}</strong>
           <span className="tiny mono">{outcome.guard}</span>{" "}
           <CopyButton value={outcome.guard} label="deployed guard address" />
           <OutcomeList steps={outcome.steps} />
+          {deployView.detail && <span className="tiny mono">{deployView.detail}</span>}
+          {deployView.retryable && (
+            <div className="row" style={{ marginTop: 8 }}>
+              <button
+                onClick={() => void deploy()}
+                disabled={deployControl.disabled}
+                title={deployControl.title}
+              >
+                Retry deploy
+              </button>
+              <span className="tiny muted">
+                Salt, prediction and init inputs are unchanged. Retrying is a new action: it
+                re-simulates and builds a new sequence-number-bound transaction — the declined
+                prompt is never replayed, and nothing was broadcast by this attempt.
+              </span>
+            </div>
+          )}
           {outcome.readError !== null && (
             <p className="tiny" style={{ color: "var(--danger)" }}>
               The post-deploy read failed, so nothing about this instance&apos;s bytecode is
@@ -1285,28 +1478,90 @@ export function DeployPanel() {
         )}
       </div>
 
-      {initResult && (
-        <div className={initResult.kind === "submitted" ? "notice info" : "error"}>
-          <strong>
-            {initResult.kind === "submitted"
-              ? "initialize landed on chain"
-              : initResult.kind === "refused"
-                ? "initialize was refused before broadcast"
-                : "initialize was broadcast and rejected"}
-          </strong>
+      {initResult && initView && (
+        <div
+          className={
+            initView.tone === "info"
+              ? "notice info"
+              : initView.tone === "warn"
+                ? "warn notice"
+                : "error"
+          }
+          data-testid="init-outcome"
+        >
+          <strong>{initView.headline}</strong>
           {initResult.kind === "submitted" ? (
             <span className="tiny">
               {starLink(initResult.hash)} - ledger {initResult.ledger ?? "-"}
             </span>
           ) : (
-            <span className="tiny mono">
-              {initResult.kind === "exported" ? "Exported" : initResult.detail}
-            </span>
+            initView.detail && <span className="tiny mono">{initView.detail}</span>
+          )}
+          {initView.retryable && (
+            <div className="row" style={{ marginTop: 8 }}>
+              <button
+                onClick={() => void initialize(outcome?.guard ?? "")}
+                disabled={!wallet || !agentPubkeyValid || !initValidation.canDeploy}
+              >
+                Retry initialize
+              </button>
+              <span className="tiny muted">
+                The agent key, addresses and caps are unchanged. Retrying is a new action: it
+                re-simulates and builds a new sequence-number-bound transaction — the declined
+                prompt is never replayed, and nothing was broadcast by this attempt.
+              </span>
+            </div>
           )}
         </div>
       )}
 
       <MigrationWizard target={outcome?.guard ?? guard} />
+    </div>
+  );
+}
+
+/**
+ * A wallet decline, stated on its own terms (issue #291).
+ *
+ * Deliberately not an `ErrorBlock`: nothing failed, the operator decided. The
+ * block carries three things an operator needs after saying no — what did *not*
+ * happen (no signature, no broadcast), that the form is untouched, and that
+ * retrying is a new explicit action rather than a replay of the declined prompt.
+ * It never holds, logs or re-sends an envelope: there is nothing of that kind
+ * to hold.
+ */
+function DeclinedBlock({
+  title,
+  detail,
+  retryLabel,
+  onRetry,
+  disabled,
+}: {
+  title: string;
+  /** The wallet's own words about the decline, when it offered any. */
+  detail: string;
+  retryLabel: string;
+  onRetry: () => void;
+  /** The same gate as the panel's primary button: observer mode, blockers, busy. */
+  disabled: boolean;
+}) {
+  return (
+    <div className="warn notice" role="status" data-testid="declined-block">
+      <span className="t">{title}</span>
+      {detail !== "" && <span className="tiny mono">{detail}</span>}
+      <span className="tiny">
+        Nothing was signed and nothing was broadcast, so no transaction of this attempt exists to
+        look up. Your deployment inputs are unchanged.
+      </span>
+      <div className="row" style={{ marginTop: 8 }}>
+        <button onClick={onRetry} disabled={disabled}>
+          {retryLabel}
+        </button>
+        <span className="tiny muted">
+          Retrying re-simulates and builds a new sequence-number-bound transaction. Nothing is ever
+          resubmitted automatically.
+        </span>
+      </div>
     </div>
   );
 }

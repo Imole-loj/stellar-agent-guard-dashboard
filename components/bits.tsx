@@ -382,7 +382,12 @@ export function OutcomeList({
           <span
             className="pill"
             style={{
-              color: step.result.kind === "submitted" ? "var(--ok)" : "var(--danger)",
+              color:
+                step.result.kind === "submitted"
+                  ? "var(--ok)"
+                  : step.result.kind === "cancelled"
+                    ? "var(--warn)"
+                    : "var(--danger)",
             }}
           >
             {step.result.kind}

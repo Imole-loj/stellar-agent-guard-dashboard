@@ -511,7 +511,10 @@ describe("describeRejectedResult", () => {
  * provider becomes a phase-specific recoverable result, and nothing is ever
  * broadcast or resubmitted automatically.
  */
-function makeWalletBoundaryServer(sendCalls: string[]): rpc.Server {
+function makeWalletBoundaryServer(
+  sendCalls: string[],
+  auth: xdr.SorobanAuthorizationEntry[] = [],
+): rpc.Server {
   const successfulSimulation = () => {
     const data = new SorobanDataBuilder()
       .setReadWrite([])
@@ -521,7 +524,7 @@ function makeWalletBoundaryServer(sendCalls: string[]): rpc.Server {
     return {
       transactionData: new SorobanDataBuilder(data),
       minResourceFee: "500",
-      result: { auth: [], retval: xdr.ScVal.scvVoid() },
+      result: { auth, retval: xdr.ScVal.scvVoid() },
       events: [],
       latestLedger: 200,
       cost: { cpuInsns: "0", memBytes: "0" },
@@ -654,5 +657,190 @@ describe("wallet-bound write boundaries", () => {
 
     assert.equal(result.kind, "submitted");
     assert.deepEqual(sendCalls, ["sent"]);
+  });
+});
+
+// ── Issue #291: a decline is a decision, not a failure ──────────────────────
+
+/**
+ * A wallet that does what an operator pressing "Cancel" does: it refuses the
+ * signature and says so in the words the providers actually use. Nothing else
+ * about the signer is unusual, so anything these tests observe comes from the
+ * decline itself.
+ */
+function decliningSigner(prompts: string[]): WalletSigner {
+  const keypair = Keypair.random();
+  return {
+    address: keypair.publicKey(),
+    currentAddress: async () => keypair.publicKey(),
+    async signTransaction(): Promise<string> {
+      prompts.push("envelope");
+      throw new WalletUserRejectedError("freighter", "sign this transaction");
+    },
+    async signAuthEntry(): Promise<string> {
+      prompts.push("auth-entry");
+      throw new WalletUserRejectedError("freighter", "sign this authorization entry");
+    },
+  };
+}
+
+/** A recorded address credential for the signer itself, as discovery returns it. */
+function makeAddressAuthEntry(signerAddress: string): xdr.SorobanAuthorizationEntry {
+  const credentials = xdr.SorobanCredentials.sorobanCredentialsAddress(
+    new xdr.SorobanAddressCredentials({
+      address: Address.fromString(signerAddress).toScAddress(),
+      nonce: BigInt(0),
+      signatureExpirationLedger: 100,
+      signature: xdr.ScVal.scvVoid(),
+    }),
+  );
+  const fn = xdr.SorobanAuthorizedFunction.sorobanAuthorizedFunctionTypeContractFn(
+    new xdr.InvokeContractArgs({
+      contractAddress: Address.fromString(GUARD_CONTRACT).toScAddress(),
+      functionName: "freeze",
+      args: [],
+    }),
+  );
+  return new xdr.SorobanAuthorizationEntry({
+    credentials,
+    rootInvocation: new xdr.SorobanAuthorizedInvocation({ function: fn, subInvocations: [] }),
+  });
+}
+
+describe("a declined signature is its own outcome (#291)", () => {
+  it("ends the write as cancelled at the envelope, with nothing broadcast", async () => {
+    const sendCalls: string[] = [];
+    const prompts: string[] = [];
+    const result = await invokeWithWallet({
+      ...WRITE_REQUEST,
+      server: makeWalletBoundaryServer(sendCalls),
+      signer: decliningSigner(prompts),
+    });
+
+    assert.equal(result.kind, "cancelled");
+    assert.match(result.detail, /declined/i, "the wallet's own words are what the operator reads");
+    assert.deepEqual(prompts, ["envelope"], "one prompt, no automatic second attempt");
+    assert.deepEqual(sendCalls, [], "a declined write never reaches the network");
+  });
+
+  it("ends the write the same way at the authorization entry, before any envelope exists", async () => {
+    const sendCalls: string[] = [];
+    const prompts: string[] = [];
+    const signer = decliningSigner(prompts);
+    const server = makeWalletBoundaryServer(sendCalls, [makeAddressAuthEntry(signer.address)]);
+
+    const result = await invokeWithWallet({ ...WRITE_REQUEST, server, signer });
+
+    assert.equal(result.kind, "cancelled");
+    assert.deepEqual(prompts, ["auth-entry"], "the envelope is never prompted after a decline");
+    assert.deepEqual(sendCalls, []);
+  });
+
+  it("keeps a simulation failure distinguishable: that is a refusal, not a decline", async () => {
+    const prompts: string[] = [];
+    const server = {
+      getAccount: async (address: string) => new Account(address, "1"),
+      simulateTransaction: async () => ({
+        id: "1",
+        latestLedger: 200,
+        events: [],
+        _parsed: true,
+        error: "host invocation failed: Error(Contract, InvalidAction)",
+      }),
+      sendTransaction: async () => {
+        assert.fail("a refused simulation must never be broadcast");
+      },
+    } as unknown as rpc.Server;
+
+    const result = await invokeWithWallet({
+      ...WRITE_REQUEST,
+      server,
+      signer: decliningSigner(prompts),
+    });
+
+    assert.equal(result.kind, "refused");
+    if (result.kind !== "refused") return;
+    assert.equal(result.stage, "discovery");
+    assert.deepEqual(prompts, [], "no signature is requested when simulation fails");
+  });
+
+  it("an explicit second attempt re-simulates on a freshly read sequence", async () => {
+    const keypair = Keypair.random();
+    const state = { reads: 0, sims: 0, sends: [] as string[] };
+    const prompts: string[] = [];
+    const presentedSequences: string[] = [];
+    const server = {
+      getAccount: async (address: string) => new Account(address, String(++state.reads)),
+      simulateTransaction: async () => {
+        state.sims += 1;
+        const data = new SorobanDataBuilder()
+          .setReadWrite([])
+          .setResourceFee(BigInt(500))
+          .setResources(1_000_000, 0, 0)
+          .build();
+        return {
+          transactionData: new SorobanDataBuilder(data),
+          minResourceFee: "500",
+          result: { auth: [], retval: xdr.ScVal.scvVoid() },
+          events: [],
+          latestLedger: 200,
+          cost: { cpuInsns: "0", memBytes: "0" },
+          stateChanges: [],
+        };
+      },
+      sendTransaction: async () => {
+        state.sends.push("sent");
+        return { status: "PENDING", hash: "ab".repeat(32), latestLedger: 200 };
+      },
+      getTransaction: async () => ({
+        status: rpc.Api.GetTransactionStatus.SUCCESS,
+        ledger: 201,
+        hash: "ab".repeat(32),
+      }),
+    } as unknown as rpc.Server;
+
+    let declineNext = true;
+    const signer: WalletSigner = {
+      address: keypair.publicKey(),
+      currentAddress: async () => keypair.publicKey(),
+      async signTransaction(transactionXdr: string): Promise<string> {
+        prompts.push("envelope");
+        const transaction = TransactionBuilder.fromXDR(transactionXdr, PASSPHRASE) as Transaction;
+        presentedSequences.push(transaction.sequence);
+        if (declineNext) {
+          declineNext = false;
+          throw new WalletUserRejectedError("freighter", "sign this transaction");
+        }
+        transaction.sign(keypair);
+        return transaction.toXDR();
+      },
+      async signAuthEntry(): Promise<string> {
+        throw new Error("this call needs no authorization entries");
+      },
+    };
+
+    const declined = await invokeWithWallet({ ...WRITE_REQUEST, server, signer });
+    assert.equal(declined.kind, "cancelled");
+    assert.deepEqual(state.sends, [], "the declined attempt broadcasts nothing");
+    assert.equal(state.reads, 1, "one account read per attempt");
+    const simsAfterDecline = state.sims;
+
+    // The retry only happens because the operator asked for it — this call is the
+    // button press, and nothing in the write path re-ran on its own.
+    const retried = await invokeWithWallet({ ...WRITE_REQUEST, server, signer });
+    assert.equal(retried.kind, "submitted");
+    assert.ok(
+      state.sims > simsAfterDecline,
+      "the retry runs a fresh simulation instead of resending the declined envelope",
+    );
+    assert.equal(state.reads, 2, "the retry re-reads the account for its sequence");
+    assert.deepEqual(state.sends, ["sent"], "exactly one broadcast, from the retry alone");
+    assert.equal(presentedSequences.length, 2, "one prompt per attempt");
+    assert.notEqual(
+      presentedSequences[0],
+      presentedSequences[1],
+      "the retried transaction is bound to a fresh sequence, not the declined one's",
+    );
+    assert.deepEqual(prompts, ["envelope", "envelope"]);
   });
 });
