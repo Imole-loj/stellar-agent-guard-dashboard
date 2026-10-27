@@ -1,3 +1,5 @@
+import { GUARD_WASM_HASH } from "stellar-agent-guard-sdk";
+
 /**
  * Network + artifact constants, and the one canonical wording for the
  * enforcement boundary.
@@ -53,6 +55,12 @@ export const TESTNET_ARTIFACT_SOURCE = "CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQ
  * the chain and refuses to proceed unless the hash matches, so a "real deploy"
  * from this UI can only ever produce an instance of the artifact Phase 1 proved.
  *
+ * The hash itself is deliberately *not* written here: it comes from the SDK's
+ * `GUARD_WASM_HASH`, which is the shared home for this constant across repos.
+ * Verification goes through the SDK's `verifyGuardWasm()` too, so there is one
+ * source rather than a copy that can rot. A contract release changes the value
+ * in an SDK release, and this dashboard picks it up by bumping the dependency.
+ *
  * `guard` is the instance those bytes are *read from* — Phase 1's address on
  * public testnet. The local sandbox moves it to the instance it deploys locally,
  * because a standalone network has no Phase 1 instance to read. The pin itself is
@@ -62,7 +70,7 @@ export const TESTNET_ARTIFACT_SOURCE = "CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQ
 export const PHASE1_ARTIFACT = {
   guard: process.env.NEXT_PUBLIC_ARTIFACT_SOURCE_CONTRACT_ID ?? TESTNET_ARTIFACT_SOURCE,
   token: "CBLQLJAG72M4XQRJMQHSKYIFVHQD7LNTNOQH2GRMCMBWMSLBSLTGTJC7",
-  wasmHash: "f47919f92e78fdd034836aa61955fc338dd56a218c448c37df1867a8c3da0f63",
+  wasmHash: GUARD_WASM_HASH,
   wasmBytes: 39673,
 } as const;
 

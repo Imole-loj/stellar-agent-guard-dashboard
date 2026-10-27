@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Address, StrKey } from "@stellar/stellar-sdk";
-import { GUARD_STORAGE_KEYS } from "stellar-agent-guard-sdk";
+import { GUARD_STORAGE_KEYS, sha256Hex as sdkSha256Hex } from "stellar-agent-guard-sdk";
 import { sha256Hex, toHex } from "../../lib/guard/scval.ts";
 import { guardStorageLedgerKeys, hashToHex, hexToBytes, sha256 } from "../../lib/guard/scval.ts";
 
@@ -12,6 +12,7 @@ test("sha256Hex produces a 64-character lowercase digest", async () => {
   // The deploy flow's artifact gate compares this digest against the pin, so it
   // has to be the SDK's digest — the same one that decides whether a deploy may
   // proceed. Asserting it here pins the property the console relies on.
+  assert.equal(sha256Hex, sdkSha256Hex, "the console must hash with the SDK's digest, not its own");
   const digest = await sha256Hex(new Uint8Array(39673));
   assert.match(digest, /^[0-9a-f]{64}$/);
   assert.equal(toHex(new Uint8Array([0, 15, 255])), "000fff");

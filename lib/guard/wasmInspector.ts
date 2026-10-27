@@ -17,6 +17,7 @@
  * responsive while parsing and hashing large artifacts.
  */
 
+import { verifyGuardWasm } from "stellar-agent-guard-sdk";
 import { PHASE1_ARTIFACT } from "./network.ts";
 import { sha256Hex } from "./scval.ts";
 
@@ -305,18 +306,21 @@ export interface IntegrityReport {
  * these bytes actually are. A verified badge requires the recomputed hash to
  * equal the pinned one, and the ledger's claim to agree — two independent
  * statements about the same artifact.
+ *
+ * The hashing and the comparison both come from the SDK's `verifyGuardWasm`,
+ * which defaults to `GUARD_WASM_HASH` and takes the bytes rather than a
+ * precomputed digest, so the hash that is compared can never be a different one
+ * from the bytes it was computed over.
  */
 export async function buildIntegrityReport(params: {
   wasm: Uint8Array;
   reportedWasmHash?: string | null;
   pinned?: { wasmHash: string; wasmBytes: number };
-  digest?: (bytes: Uint8Array) => Promise<string>;
 }): Promise<IntegrityReport> {
   const pinned = params.pinned ?? {
     wasmHash: PHASE1_ARTIFACT.wasmHash,
     wasmBytes: PHASE1_ARTIFACT.wasmBytes,
   };
-  const digest = params.digest ?? sha256Hex;
   const inspection = inspectWasm(params.wasm);
   const bytes = params.wasm.length;
 
@@ -336,8 +340,7 @@ export async function buildIntegrityReport(params: {
     };
   }
 
-  const sha256 = await digest(params.wasm);
-  const matchesPinned = sha256 === pinned.wasmHash;
+  const { ok: matchesPinned, actual: sha256 } = await verifyGuardWasm(params.wasm, pinned.wasmHash);
   const ledgerAgrees =
     !params.reportedWasmHash || params.reportedWasmHash.toLowerCase() === sha256.toLowerCase();
 
@@ -461,14 +464,13 @@ export function inspectWasmInWorker(
       reject(new Error(`Worker error: ${error.message}`));
     };
 
-    // Post the bytes to the worker (transfer ownership for efficiency)
-    worker.postMessage(
-      {
-        type: "parse",
-        bytes: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-      },
-      [bytes.buffer],
-    );
+    // The payload is a fresh copy of the bytes, deliberately without a transfer
+    // list: transferring the caller's buffer would detach it, and the parallel
+    // worker — plus the SDK's verification of the same bytes — still needs it.
+    worker.postMessage({
+      type: "parse",
+      bytes: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+    });
 
     // Return a cancellation function
     return () => {
@@ -528,14 +530,13 @@ export function hashWasmInWorker(
       reject(new Error(`Worker error: ${error.message}`));
     };
 
-    // Post the bytes to the worker (transfer ownership for efficiency)
-    worker.postMessage(
-      {
-        type: "hash",
-        bytes: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-      },
-      [bytes.buffer],
-    );
+    // Same shape as the parse worker above: a copy of the bytes with no
+    // transfer list, so the caller's buffer survives for the other worker and
+    // for `verifyGuardWasm`.
+    worker.postMessage({
+      type: "hash",
+      bytes: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+    });
 
     // Return a cancellation function
     return () => {
@@ -550,6 +551,10 @@ export function hashWasmInWorker(
  * This is the main entry point for the UI: it fetches the bytecode, then runs
  * both parsing and hashing in workers with progress callbacks, allowing the
  * operator to see coarse progress and cancel if needed.
+ *
+ * The workers supply the progress; the verdict comes from the SDK's
+ * `verifyGuardWasm` over the same bytes, so this path reaches the same answer as
+ * `buildIntegrityReport` through the same single implementation.
  */
 export async function buildIntegrityReportWithProgress(params: {
   wasm: Uint8Array;
@@ -564,9 +569,11 @@ export async function buildIntegrityReportWithProgress(params: {
   };
   const bytes = params.wasm.length;
 
-  // Run parsing and hashing in parallel
-  const [inspection, sha256] = await Promise.all([
+  // Parse and hash run in parallel (their progress drives the UI); the SDK's
+  // verification runs alongside them and is what decides the verdict.
+  const [inspection, verification] = await Promise.all([
     inspectWasmInWorker(params.wasm, params.onParseProgress ?? (() => {})),
+    verifyGuardWasm(params.wasm, pinned.wasmHash),
     hashWasmInWorker(params.wasm, params.onHashProgress ?? (() => {})),
   ]);
 
@@ -586,7 +593,8 @@ export async function buildIntegrityReportWithProgress(params: {
     };
   }
 
-  const matchesPinned = sha256 === pinned.wasmHash;
+  const sha256 = verification.actual;
+  const matchesPinned = verification.ok;
   const ledgerAgrees =
     !params.reportedWasmHash || params.reportedWasmHash.toLowerCase() === sha256.toLowerCase();
 
