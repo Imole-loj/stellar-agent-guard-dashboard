@@ -26,6 +26,10 @@ export interface ToastErrorDetails {
   status?: string | number;
   /** Optional stack trace for the inspector. */
   stack?: string;
+  /** Write stage, when known, so recovery guidance can name it (issue #385). */
+  stage?: "discovery" | "enforcement" | "submission";
+  /** Whether the failed operation was a read or a write. */
+  context?: "read" | "write";
 }
 
 export interface Toast {

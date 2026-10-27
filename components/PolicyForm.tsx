@@ -39,17 +39,24 @@ import { NO_POLICY_CONSEQUENCE, policyStateFrom } from "../lib/guard/policyState
 import {
   exportAssetCapsCsv,
   exportAssetCapsJson,
-  mergeAssetCapOverrides,
-  parseAssetCapsCsv,
-  parseAssetCapsJson,
+  previewAssetCapImport,
   type AssetCapChange,
+  type AssetCapImportPreview,
 } from "../lib/guard/assetCapsCsv.ts";
 import { useGuard } from "./GuardProvider.tsx";
 import { ErrorBlock, ScopeNotice, WarningBanner, short, starLink } from "./bits.tsx";
 import { ProtocolFunctionSelector } from "./ProtocolFunctionSelector.tsx";
-import { CsvImportExport } from "./CsvImportExport.tsx";
+import { CsvImportPreview } from "./CsvImportExport.tsx";
 import { PolicySimulationView } from "./PolicySimulationView.tsx";
-import { fetchTokenMetadata } from "../lib/guard/tokenMetadata.ts";
+import {
+  compareTokenMetadata,
+  describeAssetCapMetadata,
+  fetchTokenMetadata,
+  type TokenMetadata,
+} from "../lib/guard/tokenMetadata.ts";
+import { NETWORK } from "../lib/guard/network.ts";
+import { classifyFailure } from "../lib/guard/recoveryGuidance.ts";
+import { RecoveryGuidanceBlock } from "./RecoveryGuidance.tsx";
 import { writeControlState } from "../lib/guard/observerMode.ts";
 import {
   bindToScope,
@@ -158,6 +165,21 @@ export function PolicyForm() {
   // when the active guard changes.
   const [pendingApproval, setPendingApproval] = useState<PolicyApproval | null>(null);
   const [assetCapChanges, setAssetCapChanges] = useState<Record<string, AssetCapChange>>({});
+  // A parsed file waiting for the operator's explicit confirmation. Holding it
+  // here (and not in the draft) is what makes the import a review step: cancel
+  // discards the proposal, and the form is never half-applied.
+  const [pendingAssetImport, setPendingAssetImport] = useState<AssetCapImportPreview | null>(null);
+  // Token metadata is display-only state, keyed by canonical contract address so
+  // a metadata refresh can never write into the draft or be mistaken for the
+  // asset identity. Reads start when an address looks complete.
+  const [assetMetadata, setAssetMetadata] = useState<Record<string, TokenMetadata | null>>({});
+  const [metadataRefreshing, setMetadataRefreshing] = useState<Record<string, boolean>>({});
+  const [metadataNotice, setMetadataNotice] = useState<string | null>(null);
+  const assetMetadataRef = useRef(assetMetadata);
+  useEffect(() => {
+    assetMetadataRef.current = assetMetadata;
+  }, [assetMetadata]);
+  const metadataInFlight = useRef(new Set<string>());
   // A preset is applied in two steps: choosing one stages it here, and the
   // confirmation dialog applies it. The draft is never replaced by a stray
   // change event on the select.
@@ -293,6 +315,73 @@ export function PolicyForm() {
   // back to what is actually installed here.
   const effective = draft !== null && !draftForOtherGuard ? draft : installedDraft;
 
+  // Metadata reads follow the addresses actually present in the draft. The key
+  // is sorted and de-duplicated so reordering rows does not trigger a re-read.
+  const assetMetadataKey = [
+    ...new Set(
+      effective.assetCaps.map((row) => row.assetContractAddress.trim()).filter(isContractAddress),
+    ),
+  ]
+    .sort()
+    .join(",");
+
+  useEffect(() => {
+    const addresses = assetMetadataKey === "" ? [] : assetMetadataKey.split(",");
+    const missing = addresses.filter(
+      (address) => !(address in assetMetadataRef.current) && !metadataInFlight.current.has(address),
+    );
+    if (missing.length === 0) return;
+
+    // Debounced so typing an address only reads its metadata once the value is
+    // a complete contract id, not on each keystroke.
+    const timer = window.setTimeout(() => {
+      for (const address of missing) {
+        metadataInFlight.current.add(address);
+        void fetchTokenMetadata(NETWORK.rpcUrl, address)
+          .then((metadata) => {
+            setAssetMetadata((current) => ({ ...current, [address]: metadata }));
+          })
+          .finally(() => {
+            metadataInFlight.current.delete(address);
+          });
+      }
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [assetMetadataKey]);
+
+  /**
+   * Re-read one asset's metadata on demand and report display changes.
+   *
+   * The comparison is informational: a changed decimal or symbol is surfaced to
+   * the operator, and the cap and symbol they typed stay exactly as they are.
+   */
+  async function refreshAssetMetadata(contractId: string) {
+    const previous = assetMetadataRef.current[contractId] ?? null;
+    setMetadataRefreshing((current) => ({ ...current, [contractId]: true }));
+    try {
+      const next = await fetchTokenMetadata(NETWORK.rpcUrl, contractId, { force: true });
+      setAssetMetadata((current) => ({ ...current, [contractId]: next }));
+      if (previous) {
+        const changes = compareTokenMetadata(previous, next);
+        if (changes.length > 0) {
+          setMetadataNotice(
+            `Token metadata for ${short(contractId)} changed (${changes
+              .map((change) => `${change.field}: ${change.before} → ${change.after}`)
+              .join(", ")}). The cap and symbol in the draft were not modified.`,
+          );
+        } else if (next.source === "fallback" || next.source === "unavailable") {
+          setMetadataNotice(
+            `Token metadata for ${short(contractId)} could not be read. The cap and symbol in the draft were not modified.`,
+          );
+        } else {
+          setMetadataNotice(`Token metadata for ${short(contractId)} is unchanged.`);
+        }
+      }
+    } finally {
+      setMetadataRefreshing((current) => ({ ...current, [contractId]: false }));
+    }
+  }
+
   const validation = buildPolicyConfig(effective);
   const issues = validation.ok ? [] : validation.issues;
   const fieldErrors = useFormValidation(effective, validatePolicyDraftFields);
@@ -346,19 +435,41 @@ export function PolicyForm() {
     set("assetCaps", next, mode);
   }
 
-  async function importAssetCaps(file: File, format: "csv" | "json") {
-    try {
-      const imported =
-        format === "csv"
-          ? parseAssetCapsCsv(await file.text())
-          : parseAssetCapsJson(await file.text());
-      const merged = mergeAssetCapOverrides(effective.assetCaps, imported);
-      updateAssetCaps(merged.rows);
-      setAssetCapChanges((current) => ({ ...current, ...merged.changes }));
-      setError(null);
-    } catch (caught) {
-      setError(
-        `Asset-cap import failed: ${caught instanceof Error ? caught.message : String(caught)}`,
+  /**
+   * Read and validate a bulk file without changing the draft.
+   *
+   * A file-level problem (empty, wrong header, invalid JSON) is reported as an
+   * error. Everything else opens the review dialog, including a file with some
+   * rejected rows: the operator sees exactly what would land and what would not.
+   */
+  async function previewAssetCaps(file: File, format: "csv" | "json") {
+    const result = previewAssetCapImport(effective.assetCaps, await file.text(), format);
+    if (!result.ok) {
+      setPendingAssetImport(null);
+      setError(`Asset-cap import failed: ${result.error}`);
+      return;
+    }
+    setError(null);
+    setPendingAssetImport(result.preview);
+  }
+
+  /** The only place an import touches the draft: after explicit confirmation. */
+  function applyAssetCapsImport() {
+    const preview = pendingAssetImport;
+    if (!preview || preview.totals.accepted === 0) return;
+    updateAssetCaps(preview.mergedRows);
+    setAssetCapChanges((current) => ({ ...current, ...preview.changes }));
+    setPendingAssetImport(null);
+    setError(null);
+    if (preview.totals.rejected > 0) {
+      toast.warning(
+        "Asset-cap import applied with rejections",
+        `${preview.totals.accepted} accepted, ${preview.totals.rejected} rejected. Nothing was staged for the rejected rows.`,
+      );
+    } else {
+      toast.success(
+        "Asset caps imported",
+        `${preview.totals.added} added, ${preview.totals.updated} updated. Review the draft before signing.`,
       );
     }
   }
@@ -636,7 +747,6 @@ export function PolicyForm() {
         disabled={draftForOtherGuard}
         style={{ border: 0, padding: 0, margin: 0, minInlineSize: 0 }}
       >
-        <CsvImportExport />
         <PolicySimulationView policy={validation.ok ? validation.config : null} />
         <p className="tiny muted">
           Installing a policy resets the rolling window and restarts the dead-man-switch clock, so a
@@ -809,6 +919,12 @@ export function PolicyForm() {
                 Bulk-edit asset contract addresses and positive stroop caps. Imported rows are
                 merged by contract address.
               </span>
+              {metadataNotice && (
+                <div className="notice" role="status">
+                  <strong>Token metadata</strong>
+                  <span className="tiny">{metadataNotice}</span>
+                </div>
+              )}
               <div className="row" style={{ margin: "8px 0" }}>
                 <button
                   className="secondary"
@@ -860,7 +976,7 @@ export function PolicyForm() {
                   onChange={(event) => {
                     const file = event.target.files?.[0];
                     event.target.value = "";
-                    if (file) void importAssetCaps(file, "csv");
+                    if (file) void previewAssetCaps(file, "csv");
                   }}
                 />
                 <input
@@ -871,7 +987,7 @@ export function PolicyForm() {
                   onChange={(event) => {
                     const file = event.target.files?.[0];
                     event.target.value = "";
-                    if (file) void importAssetCaps(file, "json");
+                    if (file) void previewAssetCaps(file, "json");
                   }}
                 />
               </div>
@@ -882,6 +998,7 @@ export function PolicyForm() {
                       <th>Asset contract</th>
                       <th>Max cap (stroops)</th>
                       <th>Symbol</th>
+                      <th>Metadata</th>
                       <th aria-label="Actions" />
                     </tr>
                   </thead>
@@ -929,6 +1046,72 @@ export function PolicyForm() {
                               updateAssetCaps(next, "text");
                             }}
                           />
+                        </td>
+                        <td>
+                          {(() => {
+                            const metadata = assetMetadata[row.assetContractAddress] ?? null;
+                            const display = describeAssetCapMetadata({
+                              contractId: row.assetContractAddress,
+                              symbol: row.symbol,
+                              maxCapStroops: row.maxCapStroops,
+                              metadata,
+                            });
+                            const tier =
+                              display.source === "live" && display.freshness === "current"
+                                ? "ok"
+                                : display.source === "unavailable" || display.freshness === "stale"
+                                  ? "danger"
+                                  : "warn";
+                            return (
+                              <div className="asset-meta tiny">
+                                {metadata === null ? (
+                                  <span className="muted">{display.sourceLabel}</span>
+                                ) : (
+                                  <>
+                                    <span className={`pill ${tier}`}>{display.source}</span>
+                                    <span className="breakable">
+                                      {metadata.name} ({metadata.symbol}), {metadata.decimals}{" "}
+                                      decimals
+                                    </span>
+                                    <div
+                                      className="mono muted breakable"
+                                      title={display.contractId}
+                                    >
+                                      {short(display.contractId, 12, 8)}
+                                    </div>
+                                    {display.approximate && (
+                                      <div className="mono muted">≈ {display.approximate}</div>
+                                    )}
+                                    <div
+                                      className={`${tier === "danger" ? "danger" : "muted"} tiny`}
+                                    >
+                                      {display.sourceLabel}
+                                    </div>
+                                    {display.warning && (
+                                      <div className="tiny muted breakable">{display.warning}</div>
+                                    )}
+                                  </>
+                                )}
+                                <button
+                                  className="secondary tiny"
+                                  type="button"
+                                  aria-label={`Refresh token metadata for ${row.symbol || row.assetContractAddress}`}
+                                  disabled={
+                                    busy ||
+                                    !isContractAddress(row.assetContractAddress) ||
+                                    metadataRefreshing[row.assetContractAddress] === true
+                                  }
+                                  onClick={() =>
+                                    void refreshAssetMetadata(row.assetContractAddress)
+                                  }
+                                >
+                                  {metadataRefreshing[row.assetContractAddress]
+                                    ? "Reading…"
+                                    : "Refresh"}
+                                </button>
+                              </div>
+                            );
+                          })()}
                         </td>
                         <td>
                           <button
@@ -1116,7 +1299,9 @@ export function PolicyForm() {
         </div>
       )}
 
-      {error && <ErrorBlock title="The policy write did not complete" detail={error} />}
+      {error && (
+        <ErrorBlock title="The policy write did not complete" detail={error} context="write" />
+      )}
 
       {outcome?.kind === "invoked" && (
         <OutcomeBlock result={outcome.result} verb="set_policy" onClose={() => setOutcome(null)} />
@@ -1125,6 +1310,15 @@ export function PolicyForm() {
         <ErrorBlock
           title="The policy was rejected before signing"
           detail={outcome.issues.join("; ")}
+        />
+      )}
+
+      {pendingAssetImport && (
+        <CsvImportPreview
+          preview={pendingAssetImport}
+          busy={busy}
+          onApply={applyAssetCapsImport}
+          onCancel={() => setPendingAssetImport(null)}
         />
       )}
 
@@ -1137,6 +1331,15 @@ export function PolicyForm() {
       )}
     </div>
   );
+}
+
+/**
+ * A complete-looking SAC contract id. Stellar strkeys are base32 (`A–Z2–7`),
+ * so a 56-character `C…` prefix is the point at which a metadata read is worth
+ * making; the server-side `Address.fromString` check still governs validity.
+ */
+function isContractAddress(value: string): boolean {
+  return /^C[A-Z2-7]{55}$/.test(value.trim());
 }
 
 /**
@@ -1238,6 +1441,13 @@ export function OutcomeBlock({
           Refused during {result.stage} — nothing was broadcast, so this cost nothing
         </span>
         <span className="mono tiny">{result.detail}</span>
+        <RecoveryGuidanceBlock
+          guidance={classifyFailure({
+            message: result.detail,
+            stage: result.stage,
+            context: "write",
+          })}
+        />
       </div>
     );
   }
@@ -1253,6 +1463,9 @@ export function OutcomeBlock({
     <div className="error">
       <span className="t">Broadcast but rejected on chain — {starLink(result.hash)}</span>
       <span className="mono tiny">{result.detail}</span>
+      <RecoveryGuidanceBlock
+        guidance={classifyFailure({ message: result.detail, context: "write" })}
+      />
     </div>
   );
 }

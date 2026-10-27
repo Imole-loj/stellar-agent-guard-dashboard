@@ -775,7 +775,9 @@ export function PanicPanel({ ops }: { ops?: Partial<PanicPanelOps> }) {
         </div>
       )}
 
-      {error && <ErrorBlock title="The freeze could not be completed" detail={error} />}
+      {error && (
+        <ErrorBlock title="The freeze could not be completed" detail={error} context="write" />
+      )}
 
       {simulation && <DryRunReport simulation={simulation} onDismiss={() => setSimulation(null)} />}
 

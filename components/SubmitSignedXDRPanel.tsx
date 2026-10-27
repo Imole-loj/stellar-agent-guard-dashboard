@@ -3,12 +3,16 @@
 import { useMemo, useState } from "react";
 import { useGuard } from "./GuardProvider.tsx";
 import { ErrorBlock, starLink } from "./bits.tsx";
-import { TransactionBuilder } from "@stellar/stellar-sdk";
+import { Transaction, TransactionBuilder } from "@stellar/stellar-sdk";
 import { NETWORK } from "../lib/guard/network.ts";
 import { preflightSignedEnvelope, type SignedEnvelopePreflight } from "../lib/guard/submit.ts";
 import { announce } from "../lib/guard/useAnnounce.ts";
 import { usePwaActivity } from "../lib/guard/usePwaActivity.ts";
+import { mergeSignedEnvelopes, type MergeSignedEnvelopesResult } from "../lib/guard/multisig.ts";
+import { createHorizonServer, readAccountSigners } from "../lib/guard/multisigRead.ts";
 import { inspectSignedEnvelope } from "../lib/guard/submit.ts";
+
+type MergeReport = Extract<MergeSignedEnvelopesResult, { ok: true }>;
 
 export function SubmitSignedXDRPanel() {
   const { server } = useGuard();
@@ -16,11 +20,19 @@ export function SubmitSignedXDRPanel() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successHash, setSuccessHash] = useState<string | null>(null);
+  // Partial-envelope merging (#372). The merged XDR is loaded into the same
+  // submission box, so the operator reviews the exact bytes that will be sent.
+  const [mergeInput, setMergeInput] = useState("");
+  const [mergeReport, setMergeReport] = useState<MergeReport | null>(null);
+  const [mergeError, setMergeError] = useState<string | null>(null);
+  const [merging, setMerging] = useState(false);
+  const [verificationNote, setVerificationNote] = useState<string | null>(null);
+
   const [preflight, setPreflight] = useState<SignedEnvelopePreflight | null>(null);
   const [checkedEnvelope, setCheckedEnvelope] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
   // A pending write is work an app-shell update must not interrupt (#398).
-  usePwaActivity(busy, "write");
+  usePwaActivity(busy || merging, "write");
 
   const inspection = useMemo(() => inspectSignedEnvelope(xdr.trim(), NETWORK.passphrase), [xdr]);
 
@@ -71,6 +83,79 @@ export function SubmitSignedXDRPanel() {
     }
   }
 
+  /**
+   * Combine partial envelopes.
+   *
+   * Verification needs the source account's signer keys. The dashboard reads
+   * them from Horizon when it can; if that read fails (an air-gapped workstation,
+   * for example) the merge still runs, but the report says the signatures were
+   * not network-verified instead of implying they were.
+   */
+  async function merge() {
+    const envelopes = mergeInput
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line !== "");
+    if (envelopes.length < 2) {
+      setMergeError("Paste at least two signed envelopes, one base64 XDR per line.");
+      return;
+    }
+
+    setMerging(true);
+    setMergeError(null);
+    setMergeReport(null);
+    setVerificationNote(null);
+    try {
+      let signers: string[] = [];
+      try {
+        const first = TransactionBuilder.fromXDR(envelopes[0]!, NETWORK.passphrase);
+        const source = first instanceof Transaction ? first.source : null;
+        if (source === null) {
+          setVerificationNote(
+            "Signatures were not network-verified: the first input is not a transaction envelope.",
+          );
+        } else {
+          const account = await readAccountSigners(createHorizonServer(), source);
+          if (account.ok) {
+            signers = account.value.signers
+              .filter((signer) => signer.kind === "ed25519" || signer.kind === undefined)
+              .map((signer) => signer.key);
+          } else {
+            setVerificationNote(
+              `Signatures were not network-verified: the source account's signers could not be read (${account.error}).`,
+            );
+          }
+        }
+      } catch {
+        setVerificationNote(
+          "Signatures were not network-verified because the first envelope could not be decoded.",
+        );
+      }
+
+      const result = mergeSignedEnvelopes({
+        envelopes: envelopes.map((envelope, index) => ({
+          xdr: envelope,
+          label: `Envelope ${index + 1}`,
+        })),
+        networkPassphrase: NETWORK.passphrase,
+        ...(signers.length > 0 ? { signers } : {}),
+      });
+      if (!result.ok) {
+        setMergeError(result.error);
+        return;
+      }
+      setMergeReport(result);
+      setXdr(result.mergedXdr);
+      setMergeInput("");
+      setSuccessHash(null);
+      announce(
+        `${result.signatures.length} signature${result.signatures.length === 1 ? "" : "s"} merged — review the envelope before submitting`,
+      );
+    } finally {
+      setMerging(false);
+    }
+  }
+
   return (
     <div className="panel">
       <h2>Submit Signed XDR</h2>
@@ -78,6 +163,81 @@ export function SubmitSignedXDRPanel() {
         Broadcast an externally assembled and signed transaction envelope. Inspect its network
         binding, source, operation types, and context before broadcast.
       </p>
+
+      <details className="merge-panel">
+        <summary>Merge partial signatures (multisig / air-gapped)</summary>
+        <p className="tiny muted">
+          Combine separately signed copies of the same envelope. Source, sequence, fee, time bounds,
+          operations and authorization payloads must match exactly; incompatible inputs are refused
+          without combining anything. Duplicate signatures are counted once, and two different
+          signatures that share a signer hint are both preserved and reported.
+        </p>
+        <textarea
+          value={mergeInput}
+          onChange={(event) => setMergeInput(event.target.value)}
+          placeholder={"One signed transaction envelope per line (base64)\nAAAAAg…"}
+          style={{ width: "100%", height: "96px", marginBottom: "12px", fontFamily: "monospace" }}
+          aria-label="Partial signed envelopes, one base64 XDR per line"
+        />
+        <div className="row">
+          <button
+            type="button"
+            className="secondary"
+            disabled={merging || mergeInput.trim() === ""}
+            onClick={merge}
+          >
+            {merging ? "Merging…" : "Merge signatures"}
+          </button>
+        </div>
+
+        {mergeError && <ErrorBlock title="Merge refused" detail={mergeError} context="write" />}
+
+        {mergeReport && (
+          <div className="notice info merge-report" role="status">
+            <strong>
+              {mergeReport.signatures.length} unique signature
+              {mergeReport.signatures.length === 1 ? "" : "s"} merged for {NETWORK.name}
+            </strong>
+            <span className="tiny mono breakable">
+              {mergeReport.facts.source} · sequence {mergeReport.facts.sequence}
+            </span>
+            <span className="tiny">
+              {mergeReport.duplicates.length} duplicate
+              {mergeReport.duplicates.length === 1 ? "" : "s"}, {mergeReport.conflicts.length} hint
+              conflict{mergeReport.conflicts.length === 1 ? "" : "s"}. The merged envelope is loaded
+              in the submission box below — review it before submitting.
+            </span>
+            <span className="tiny">
+              {mergeReport.signatures.filter((signature) => signature.verification === "verified")
+                .length === mergeReport.signatures.length
+                ? "Every signature verified against the source account's signers on this network."
+                : `${mergeReport.signatures.filter((signature) => signature.verification === "verified").length} of ${mergeReport.signatures.length} signatures were verified against known signers; the rest were left unchecked rather than attributed to the wrong key.`}
+            </span>
+            {verificationNote && <span className="tiny muted">{verificationNote}</span>}
+
+            {mergeReport.duplicates.length > 0 && (
+              <ul className="tiny" style={{ margin: "4px 0 0 16px", padding: 0 }}>
+                {mergeReport.duplicates.map((duplicate) => (
+                  <li key={`duplicate-${duplicate.hint}-${duplicate.signature}`}>
+                    duplicate hint {duplicate.hint}: carried by {duplicate.sources.join(", ")}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {mergeReport.conflicts.length > 0 && (
+              <ul className="tiny" style={{ margin: "4px 0 0 16px", padding: 0 }}>
+                {mergeReport.conflicts.map((conflict) => (
+                  <li key={`conflict-${conflict.hint}`}>
+                    hint {conflict.hint} has {conflict.signatures.length} distinct signatures (
+                    {conflict.sources.join(", ")}); both were kept.
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+      </details>
+
       <textarea
         value={xdr}
         onChange={(e) => {
@@ -211,7 +371,9 @@ export function SubmitSignedXDRPanel() {
           </span>
         </div>
       )}
-      {error && <ErrorBlock title="Submission failed" detail={error} />}
+      {error && (
+        <ErrorBlock title="Submission failed" detail={error} context="write" stage="submission" />
+      )}
       {successHash && (
         <div className="notice info" style={{ marginTop: "16px" }}>
           <strong>Transaction submitted — {starLink(successHash)}</strong>

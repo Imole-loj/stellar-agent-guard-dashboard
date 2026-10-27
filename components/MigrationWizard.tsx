@@ -296,7 +296,9 @@ export function MigrationWizard({ target }: { target: string }) {
         </div>
       )}
 
-      {error && <ErrorBlock title="The migration could not be applied" detail={error} />}
+      {error && (
+        <ErrorBlock title="The migration could not be applied" detail={error} context="write" />
+      )}
 
       {applied?.kind === "invalid" && (
         <div className="error" role="alert">
