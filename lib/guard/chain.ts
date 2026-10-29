@@ -42,6 +42,7 @@ import {
   type PolicyConfig,
   decodePolicy,
 } from "stellar-agent-guard-sdk";
+import { decodeValidationOutcome, type ValidationOutcome } from "./policyPreflight.ts";
 import { withTimeout, DashboardReadError } from "./timeout.ts";
 import { buildReadDiagnostic, redactDiagnosticText } from "../rpc/timeouts.ts";
 
@@ -170,6 +171,34 @@ export function readPolicy(
 ): Promise<ReadResult<PolicyConfig | null>> {
   return readContract<PolicyConfig | null>(server, guard, "policy", [], source, (retval) =>
     retval.type === "scvVoid" ? null : decodePolicy(retval),
+  );
+}
+
+/**
+ * The `validate_policy` dry run (SPEC §8.1, contracts issue #35): would this
+ * *candidate* config pass `set_policy`, and if not, which §8 rule fails first?
+ *
+ * A read like any other — no auth, no events, no state writes — so it is safe to
+ * call before a wallet is ever prompted. `config` is the very same encoded
+ * `ScVal` the write would send, which is what makes the answer meaningful: the
+ * contract validates the bytes it is handed, not a re-encoding of them.
+ *
+ * Failures stay failures (`{ ok: false }`), never a verdict: see
+ * `preflightDecision` for why a missing read never blocks the write.
+ */
+export function validatePolicy(
+  server: rpc.Server,
+  guard: string,
+  config: Xdr.ScVal,
+  source?: string,
+): Promise<ReadResult<ValidationOutcome>> {
+  return readContract<ValidationOutcome>(
+    server,
+    guard,
+    "validate_policy",
+    [config],
+    source,
+    decodeValidationOutcome,
   );
 }
 

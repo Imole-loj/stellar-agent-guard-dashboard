@@ -34,6 +34,7 @@ import {
   SorobanDataBuilder,
   TransactionBuilder,
   nativeToScVal,
+  scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
 import { NETWORK, PHASE1_ARTIFACT } from "../../lib/guard/network.ts";
@@ -135,6 +136,97 @@ interface ContractCall {
   contract: string;
   fn: string;
   args: xdr.ScVal[];
+}
+
+/** `ValidationOutcome::Invalid(rule)` — SPEC §8.1's enum over the wire. */
+function invalidOutcome(rule: string): xdr.ScVal {
+  return xdr.ScVal.scvVec([
+    xdr.ScVal.scvSymbol("Invalid"),
+    xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(rule)]),
+  ]);
+}
+
+/** `ValidationOutcome::Valid`. */
+const VALID_OUTCOME = xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("Valid")]);
+
+const MAX_LIST_ENTRIES = 256;
+const MAX_WINDOW_SECS = 315_360_000;
+
+/**
+ * A subset of the contract's §8 validation, for `validate_policy` (issue #259).
+ *
+ * The rules are the ones a form-built config can reach while still passing the
+ * dashboard's own local checks — evaluated in SPEC §8.1 order, like the
+ * contract's `validate_policy`, so the preflight reports the *first* failure.
+ * This is a test double, not a second implementation of §8: rules the form
+ * cannot produce from its fields are left out rather than approximated.
+ */
+function validationOutcome(contract: string, configScVal: xdr.ScVal): xdr.ScVal {
+  let config: Record<string, unknown>;
+  try {
+    config = scValToNative(configScVal) as Record<string, unknown>;
+  } catch {
+    // An undecodable config can never be a valid config.
+    return invalidOutcome("AmountSign");
+  }
+  const big = (value: unknown): bigint =>
+    typeof value === "bigint" ? value : BigInt((value as string | number | undefined) ?? 0);
+  const list = (key: string): unknown[] => (config[key] as unknown[] | undefined) ?? [];
+  const strings = (key: string): string[] => list(key).map((item) => String(item));
+  const hasDuplicate = (values: string[]): boolean => new Set(values).size !== values.length;
+
+  if (strings("assets").length > MAX_LIST_ENTRIES) return invalidOutcome("AssetListTooLong");
+  if (list("protocols").length > MAX_LIST_ENTRIES) return invalidOutcome("ProtocolListTooLong");
+  if (strings("recipients").length > MAX_LIST_ENTRIES)
+    return invalidOutcome("RecipientListTooLong");
+
+  if (big(config.per_tx_cap) < 0n || big(config.window_cap) < 0n)
+    return invalidOutcome("AmountSign");
+
+  const windowSecs = big(config.window_secs);
+  const recipientCaps = list("recipient_window_caps") as Array<{ cap?: unknown }>;
+  if (
+    (big(config.window_cap) !== 0n || recipientCaps.some((row) => big(row.cap) > 0n)) &&
+    windowSecs === 0n
+  )
+    return invalidOutcome("WindowRequiresWidth");
+
+  const activeFrom = big(config.active_from);
+  const activeUntil = big(config.active_until);
+  if (activeUntil !== 0n && activeUntil <= activeFrom) return invalidOutcome("ActiveWindowOrder");
+
+  const addressLists = ["assets", "recipients", "blocked_recipients"].map(strings);
+  if (
+    addressLists.some((values) => values.includes(contract)) ||
+    list("protocols").some(
+      (rule) => String((rule as { contract?: unknown }).contract) === contract,
+    ) ||
+    recipientCaps.some((row) => String((row as { recipient?: unknown }).recipient) === contract)
+  )
+    return invalidOutcome("SelfAddressInList");
+
+  if (addressLists.some(hasDuplicate)) return invalidOutcome("DuplicateAddressInList");
+
+  const protocolContracts = list("protocols").map((rule) =>
+    String((rule as { contract?: unknown }).contract),
+  );
+  if (hasDuplicate(protocolContracts)) return invalidOutcome("ProtocolContractDuplicate");
+
+  for (const rule of list("protocols") as Array<{ fns?: string[] | null }>) {
+    const fns = rule.fns ?? null;
+    if (fns !== null && (fns.length === 0 || hasDuplicate(fns.map(String))))
+      return invalidOutcome("ProtocolFnListInvalid");
+  }
+
+  const perTxCap = big(config.per_tx_cap);
+  const windowCap = big(config.window_cap);
+  if (perTxCap > 0n && windowCap > 0n && perTxCap > windowCap)
+    return invalidOutcome("PerTxCapExceedsWindowCap");
+
+  if (windowSecs > BigInt(MAX_WINDOW_SECS) || big(config.dms_grace_secs) > BigInt(MAX_WINDOW_SECS))
+    return invalidOutcome("DurationExceedsBound");
+
+  return VALID_OUTCOME;
 }
 
 function decodeCall(transactionXdr: string): ContractCall | null {
@@ -452,6 +544,8 @@ export class SorobanRpcMock {
       });
     } else if (call?.fn === "policy") {
       retval = this.guard(call.contract).policy ?? xdr.ScVal.scvVoid();
+    } else if (call?.fn === "validate_policy") {
+      retval = validationOutcome(call.contract, call.args[0] ?? xdr.ScVal.scvVoid());
     }
 
     return {

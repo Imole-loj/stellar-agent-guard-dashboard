@@ -280,6 +280,11 @@ test("a diff awaiting confirmation is cancelled by a guard switch and cannot be 
     await act(async () => {
       button(form.container, "Sign and install policy").click();
     });
+    // The install now runs the read-only `validate_policy` preflight (issue
+    // #259) before it can show the diff, so the dialog lands a tick later.
+    await act(async () => {
+      await sleep(10);
+    });
     assert.ok(diffDialog(), "the operator is asked to confirm the change to guard A");
 
     await form.rerender(contextFor(GUARD_B, 2_000_000n, s));
@@ -290,7 +295,14 @@ test("a diff awaiting confirmation is cancelled by a guard switch and cannot be 
     assert.equal(diffDialog(), null, "an approval does not survive leaving the guard it was for");
 
     assert.deepEqual(s.signerCalls, [], "no signer was requested for any guard");
-    assert.deepEqual(s.serverTouches, [], "no transaction was built or simulated");
+    // The one RPC touch behind that dialog is the `validate_policy` preflight
+    // read (its failed attempt also reads `serverURL` for a diagnostic). No
+    // write was simulated, signed or broadcast.
+    assert.deepEqual(
+      s.serverTouches.filter((name) => name !== "serverURL"),
+      ["simulateTransaction"],
+      "only the preflight read was made, no transaction was built",
+    );
   } finally {
     await form.unmount();
   }

@@ -21,6 +21,12 @@ import {
   type SecurityProfile,
 } from "../lib/guard/presets.ts";
 import { installPolicy, revokePolicy } from "../lib/guard/guardOps.ts";
+import { validatePolicy } from "../lib/guard/chain.ts";
+import {
+  preflightDecision,
+  type PolicyRuleGuidance,
+  type PreflightDecision,
+} from "../lib/guard/policyPreflight.ts";
 import { historyShortcut, useHistoryState } from "../lib/guard/useHistoryState.ts";
 import { usePwaActivity } from "../lib/guard/usePwaActivity.ts";
 import { computePolicyDiff, type PolicyDiff } from "../lib/guard/policyDiff.ts";
@@ -161,6 +167,12 @@ export function PolicyForm() {
   usePwaActivity(busy, "write");
   const [outcome, setOutcome] = useState<PolicyOutcome | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The contract's own verdict on the draft at the last install attempt (issue
+  // #259): nothing until a preflight has run, then the failing §8 rule's copy.
+  // Any edit clears it, because an edited draft is a new question to ask.
+  const [preflightIssue, setPreflightIssue] = useState<
+    (PolicyRuleGuidance & { rule: string }) | null
+  >(null);
   // The approval behind the open diff dialog, bound to the guard it was computed
   // for. A stale one is unreachable (see `approval` below), and is cleared outright
   // when the active guard changes.
@@ -214,6 +226,7 @@ export function PolicyForm() {
     setPendingApproval(null);
     setOutcome(null);
     setError(null);
+    setPreflightIssue(null);
     setPendingPreset(null);
     setPendingPolicyImport(null);
     setAssetCapChanges({});
@@ -226,6 +239,7 @@ export function PolicyForm() {
     if (draftForOtherGuard) return;
     pushDraft(next);
     setDraftScope(next === null ? null : activeScope);
+    setPreflightIssue(null);
   }
 
   /** Coalesced text edit. Refused while the draft belongs to another guard. */
@@ -233,6 +247,7 @@ export function PolicyForm() {
     if (draftForOtherGuard) return;
     editDraftRaw(next);
     setDraftScope(activeScope);
+    setPreflightIssue(null);
   }
 
   /** The explicit discard: the only way an edit for another guard is dropped. */
@@ -403,7 +418,10 @@ export function PolicyForm() {
   // other write control in the console (issue #101).
   const installControl = writeControlState(wallet, {
     busy,
-    extraDisabled: issues.length > 0 || draftForOtherGuard,
+    // A failing preflight blocks submission (issue #259). The block is cleared
+    // by the next edit, which is also the only thing that could change the
+    // verdict — re-signing an unchanged config would fail the same rule.
+    extraDisabled: issues.length > 0 || draftForOtherGuard || preflightIssue !== null,
     label: "install the policy",
   });
   const exportControl = writeControlState(wallet, {
@@ -531,6 +549,27 @@ export function PolicyForm() {
     if (draftForOtherGuard) return;
     if (!exportOnly) {
       if (!validation.ok) return;
+      // Preflight before anything is shown for signing (issue #259): the
+      // contract dry-runs these exact bytes against its own §8 rules, so the
+      // operator sees which rule would reject the policy without spending a
+      // signature to find out. It is a read — no auth, no events, no writes —
+      // and an unavailable read leaves the verdict open rather than blocking:
+      // `set_policy` still rejects with `invalid_config` on chain, which is the
+      // guarantee clients running an older contract keep.
+      let verdict: PreflightDecision = { kind: "allow" };
+      setBusy(true);
+      try {
+        verdict = preflightDecision(await validatePolicy(server, guard, validation.scval));
+      } catch {
+        // No verdict is available; the write proceeds and the contract guards.
+      } finally {
+        setBusy(false);
+      }
+      if (verdict.kind === "block") {
+        setPreflightIssue({ rule: verdict.rule, field: verdict.field, message: verdict.message });
+        return;
+      }
+      setPreflightIssue(null);
       const installed =
         snapshot?.policy.ok && snapshot.policy.value !== null ? snapshot.policy.value : null;
       // The approval carries the draft it was shown for and the guard it is for.
@@ -1221,6 +1260,23 @@ export function PolicyForm() {
               </li>
             ))}
           </ul>
+        </div>
+      )}
+
+      {/* The contract's own verdict on the draft when it names a failing §8
+        rule (issue #259). Local validation only knows what the form can
+        express; this is the guard saying which rule *it* would reject — so it
+        blocks the install until the draft is edited, which is also the only
+        thing that could change the verdict. */}
+      {preflightIssue && (
+        <div className="error">
+          <span className="t">The guard would reject this policy</span>
+          <p className="tiny" style={{ margin: "4px 0 0" }}>
+            <strong>{preflightIssue.field}:</strong> {preflightIssue.message}
+          </p>
+          <p className="tiny" style={{ margin: "4px 0 0" }}>
+            Nothing was signed or submitted. Fix the field above and sign again.
+          </p>
         </div>
       )}
 
