@@ -222,6 +222,115 @@ describe("signed envelope preflight", () => {
   });
 });
 
+describe("invokeWithWallet source sequence freshness (issue #392)", () => {
+  it("uses fresh accounts at one base sequence for probe, enforcement, and final envelope", async () => {
+    const simulationData = new SorobanDataBuilder()
+      .setReadWrite([])
+      .setResourceFee(BigInt(500))
+      .setResources(1_000_000, 0, 0)
+      .build();
+    const simulation = {
+      transactionData: new SorobanDataBuilder(simulationData),
+      minResourceFee: "500",
+      result: { auth: [], retval: xdr.ScVal.scvVoid() },
+      events: [],
+      latestLedger: 200,
+      cost: { cpuInsns: "0", memBytes: "0" },
+      stateChanges: [],
+    } as unknown as Parameters<typeof assembleFromSimulation>[0]["simulation"];
+    const simulatedSequences: string[] = [];
+    let simulationCalls = 0;
+    const server = {
+      getAccount: async () => new Account(SIGNER_ADDRESS, "42"),
+      simulateTransaction: async (transaction: any) => {
+        simulatedSequences.push((transaction.toEnvelope() as any).v1.tx.seqNum.toString());
+        simulationCalls += 1;
+        return simulation;
+      },
+    } as any;
+    const signer = {
+      address: SIGNER_ADDRESS,
+      signAuthEntry: async () => {
+        throw new Error("export-only invocation must not prompt for auth");
+      },
+      signTransaction: async () => {
+        throw new Error("export-only invocation must not prompt for a transaction");
+      },
+    };
+
+    const originalSequenceNumber = Account.prototype.sequenceNumber;
+    const sourceAccounts: Account[] = [];
+    Account.prototype.sequenceNumber = function () {
+      sourceAccounts.push(this);
+      return originalSequenceNumber.call(this);
+    };
+    try {
+      const result = await invokeWithWallet({
+        server,
+        contract: GUARD_CONTRACT,
+        fn: "check",
+        args: [],
+        signer,
+        passphrase: PASSPHRASE,
+        exportOnly: true,
+      });
+      assert.equal(result.kind, "exported");
+      if (result.kind !== "exported") return;
+
+      const submitted = TransactionBuilder.fromXDR(result.xdr, PASSPHRASE);
+      assert.deepEqual(simulatedSequences, ["43", "43"]);
+      assert.equal((submitted.toEnvelope() as any).v1.tx.seqNum.toString(), "43");
+      assert.equal(simulationCalls, 2);
+      const passAccounts = sourceAccounts.slice(1);
+      assert.equal(
+        passAccounts.length,
+        3,
+        "probe, enforcement, and final build each get an account",
+      );
+      assert.equal(new Set(passAccounts).size, 3, "each pass must use a distinct Account object");
+    } finally {
+      Account.prototype.sequenceNumber = originalSequenceNumber;
+    }
+  });
+
+  it("does not build or sign a final transaction when the probe fails", async () => {
+    let simulationCalls = 0;
+    let walletPrompts = 0;
+    const server = {
+      getAccount: async () => new Account(SIGNER_ADDRESS, "42"),
+      simulateTransaction: async () => {
+        simulationCalls += 1;
+        return { error: "probe refused" };
+      },
+    } as any;
+    const signer = {
+      address: SIGNER_ADDRESS,
+      signAuthEntry: async () => {
+        walletPrompts += 1;
+        throw new Error("a failed probe must not prompt for auth");
+      },
+      signTransaction: async () => {
+        walletPrompts += 1;
+        throw new Error("a failed probe must not sign a final transaction");
+      },
+    };
+
+    const result = await invokeWithWallet({
+      server,
+      contract: GUARD_CONTRACT,
+      fn: "check",
+      args: [],
+      signer,
+      passphrase: PASSPHRASE,
+      exportOnly: true,
+    });
+    assert.equal(result.kind, "refused");
+    if (result.kind === "refused") assert.equal(result.stage, "discovery");
+    assert.equal(simulationCalls, 1);
+    assert.equal(walletPrompts, 0);
+  });
+});
+
 describe("assembleFromSimulation — create_contract authorization preservation", () => {
   it("attaches a recorded create_contract auth entry to the assembled operation", () => {
     const authEntry = makeCreateContractAuthEntry(GUARD_CONTRACT);

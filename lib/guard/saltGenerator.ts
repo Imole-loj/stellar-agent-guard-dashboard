@@ -365,7 +365,7 @@ export interface InstanceReader {
 export async function contractAlreadyDeployed(
   server: InstanceReader,
   address: string,
-): Promise<{ exists: boolean; detail: string | null }> {
+): Promise<{ exists: boolean; detail: string | null; error?: string }> {
   const trimmed = address.trim();
   if (!isContractAddress(trimmed)) {
     return { exists: false, detail: `${trimmed} is not a contract address yet` };
@@ -373,9 +373,15 @@ export async function contractAlreadyDeployed(
   try {
     await server.getContractInstance(trimmed);
     return { exists: true, detail: "a contract already lives at this address" };
-  } catch {
-    // Soroban RPC answers 404 for an unknown contract; either way the address is free.
-    return { exists: false, detail: null };
+  } catch (error) {
+    const code =
+      typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+    if (code === 404) return { exists: false, detail: null };
+    return {
+      exists: false,
+      detail: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 

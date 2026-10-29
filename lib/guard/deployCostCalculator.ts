@@ -17,6 +17,12 @@ export interface DeployCostBreakdown {
   balanceAfterRequired: string;
   safetyBufferXlm: string;
   warning: boolean;
+  baseFeeXlmToStroops: bigint;
+  wasmUploadFeeXlmToStroops: bigint;
+  contractInstanceFeeXlmToStroops: bigint;
+  initialRentDepositXlmToStroops: bigint;
+  totalRequiredXlmToStroops: bigint;
+  sourceNote?: string;
 }
 
 const STROOPS_PER_XLM = 10_000_000n;
@@ -65,7 +71,6 @@ function compareDecimalStrings(left: string, right: string): number {
   if (diff > 0n) return 1;
   return 0;
 }
-
 function computeInitialRentDeposit(input: DeployCostInput): string {
   if (!input.uploadWasm) return "0.0000000";
   const perByteRent = 25_375n;
@@ -74,7 +79,42 @@ function computeInitialRentDeposit(input: DeployCostInput): string {
   return stroopsToDecimal(INITIAL_RENT_DEPOSIT_STROOPS + extraStroops);
 }
 
+function computeInitialRentDepositStroops(input: DeployCostInput): bigint {
+  if (!input.uploadWasm) return 0n;
+  const perByteRent = 25_375n;
+  const bytes = BigInt(Math.max(0, input.contractInstanceBytes));
+  return INITIAL_RENT_DEPOSIT_STROOPS + (bytes * perByteRent) / 1_000n;
+}
+
+function computeStroopsBreakdown(input: DeployCostInput): {
+  baseFeeXlmToStroops: bigint;
+  wasmUploadFeeXlmToStroops: bigint;
+  contractInstanceFeeXlmToStroops: bigint;
+  initialRentDepositXlmToStroops: bigint;
+  totalRequiredXlmToStroops: bigint;
+} {
+  const baseFeeXlmToStroops = BASE_TRANSACTION_FEE_STROOPS;
+  const wasmUploadFeeXlmToStroops = input.uploadWasm ? WASM_UPLOAD_FEE_STROOPS : 0n;
+  const contractInstanceFeeXlmToStroops = CONTRACT_INSTANCE_FEE_STROOPS;
+  const initialRentDepositXlmToStroops = computeInitialRentDepositStroops(input);
+  const totalRequiredXlmToStroops = BigInt(
+    baseFeeXlmToStroops +
+      wasmUploadFeeXlmToStroops +
+      contractInstanceFeeXlmToStroops +
+      initialRentDepositXlmToStroops,
+  );
+
+  return {
+    baseFeeXlmToStroops,
+    wasmUploadFeeXlmToStroops,
+    contractInstanceFeeXlmToStroops,
+    initialRentDepositXlmToStroops,
+    totalRequiredXlmToStroops,
+  };
+}
+
 export function calculateDeployCost(input: DeployCostInput): DeployCostBreakdown {
+  const stroopsBreakdown = computeStroopsBreakdown(input);
   const baseFeeXlm = stroopsToDecimal(BASE_TRANSACTION_FEE_STROOPS);
   const wasmUploadFeeXlm = input.uploadWasm
     ? stroopsToDecimal(WASM_UPLOAD_FEE_STROOPS)
@@ -92,6 +132,14 @@ export function calculateDeployCost(input: DeployCostInput): DeployCostBreakdown
   const warning =
     compareDecimalStrings(balanceXlm, addDecimalStrings(totalRequiredXlm, safetyBufferXlm)) < 0;
 
+  // Determine source note based on warning state
+  let sourceNote: string | undefined;
+  if (warning) {
+    sourceNote = `Balance is below the reserve safety threshold (${safetyBufferXlm} XLM cushion): fund at least ${(Number(totalRequiredXlm) + Number(safetyBufferXlm)).toFixed(7)} XLM before signing. Fees are estimates based on current network conditions and may vary at signing time.`;
+  } else {
+    sourceNote = `Fees are estimates based on current network conditions and may vary at signing time.`;
+  }
+
   return {
     baseFeeXlm,
     wasmUploadFeeXlm,
@@ -104,6 +152,12 @@ export function calculateDeployCost(input: DeployCostInput): DeployCostBreakdown
     balanceAfterRequired: balanceAfterRequiredXlm,
     safetyBufferXlm,
     warning,
+    baseFeeXlmToStroops: stroopsBreakdown.baseFeeXlmToStroops,
+    wasmUploadFeeXlmToStroops: stroopsBreakdown.wasmUploadFeeXlmToStroops,
+    contractInstanceFeeXlmToStroops: stroopsBreakdown.contractInstanceFeeXlmToStroops,
+    initialRentDepositXlmToStroops: stroopsBreakdown.initialRentDepositXlmToStroops,
+    totalRequiredXlmToStroops: stroopsBreakdown.totalRequiredXlmToStroops,
+    sourceNote,
   };
 }
 

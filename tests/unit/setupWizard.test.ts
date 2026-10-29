@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { before, test } from "node:test";
-import { Address, xdr } from "@stellar/stellar-sdk";
+import { Address, SorobanDataBuilder, xdr } from "@stellar/stellar-sdk";
 import type { ReactElement } from "react";
 import { installDom, loadReact, sleep, type Act } from "./domHarness.ts";
 import { SetupWizard } from "../../components/SetupWizard.tsx";
@@ -9,6 +9,9 @@ import { GuardContext } from "../../components/GuardProvider.tsx";
 import type { GuardSnapshot } from "../../lib/guard/guardOps.ts";
 import { SETUP_STORAGE_KEY } from "../../lib/guard/setupChecklist.ts";
 import { PHASE1_ARTIFACT } from "../../lib/guard/network.ts";
+import { DashboardReadError } from "../../lib/guard/timeout.ts";
+import { policyToScVal } from "stellar-agent-guard-sdk";
+import { POLICY_PRESETS } from "../../lib/guard/presets.ts";
 import { guardStatusScVal } from "../mocks/sorobanFixtures.ts";
 
 installDom();
@@ -181,7 +184,11 @@ function createSetupServer(): SetupServer {
   };
 }
 
-function contextValue(snapshot: GuardSnapshot, server: unknown = noNetworkServer) {
+function contextValue(
+  snapshot: GuardSnapshot,
+  server: unknown = noNetworkServer,
+  guard: string = snapshot.guard,
+) {
   return {
     server,
     wallet: null,
@@ -193,7 +200,7 @@ function contextValue(snapshot: GuardSnapshot, server: unknown = noNetworkServer
       throw new Error("no signing in setup-wizard tests");
     },
     instances: [{ guard: GUARD, label: "Test guard", provenance: "test" }],
-    guard: GUARD,
+    guard,
     selectGuard: () => {},
     addInstance: () => {},
     snapshot,
@@ -221,6 +228,7 @@ function contextValue(snapshot: GuardSnapshot, server: unknown = noNetworkServer
 
 interface Rendered {
   container: HTMLElement;
+  rerender: (snapshot: GuardSnapshot, server?: unknown, guard?: string) => Promise<void>;
   unmount: () => Promise<void>;
 }
 
@@ -228,6 +236,7 @@ async function render(
   element: ReactElement,
   snapshot: GuardSnapshot,
   server: unknown = noNetworkServer,
+  guard: string = snapshot.guard,
 ): Promise<Rendered> {
   const container = document.createElement("div");
   document.body.appendChild(container);
@@ -237,7 +246,7 @@ async function render(
     root.render(
       react.createElement(
         GuardContext.Provider,
-        { value: contextValue(snapshot, server) },
+        { value: contextValue(snapshot, server, guard) },
         element,
       ),
     );
@@ -248,6 +257,17 @@ async function render(
   });
   return {
     container,
+    rerender: async (nextSnapshot, nextServer = server, nextGuard = guard) => {
+      await act(async () => {
+        root?.render(
+          react.createElement(
+            GuardContext.Provider,
+            { value: contextValue(nextSnapshot, nextServer, nextGuard) },
+            element,
+          ),
+        );
+      });
+    },
     unmount: async () => {
       await act(async () => {
         root?.unmount();
@@ -462,6 +482,263 @@ test("a failed initialize read can be re-read in place, read-only, without any w
       0,
       "the re-read is read-only — no write path is touched",
     );
+  } finally {
+    await rendered.unmount();
+  }
+});
+
+test("switching guards does not show the previous guard's initialize or snapshot reads", async () => {
+  window.localStorage.removeItem(SETUP_STORAGE_KEY);
+  let resolveNext: ((value: unknown) => void) | undefined;
+  const nextGuardRead = new Promise<unknown>((resolve) => {
+    resolveNext = resolve;
+  });
+  const server = {
+    getContractInstance: async (address: string) => {
+      if (address === GUARD) {
+        return { storage: [{ key: { vec: [{ symbol: "Initialized" }] }, val: { bool: true } }] };
+      }
+      return nextGuardRead;
+    },
+  } as typeof noNetworkServer;
+  const oldSnapshot = {
+    ...policyMissingSnapshot(),
+    status: {
+      ok: true,
+      value: {
+        has_policy: true,
+        admin_frozen: false,
+        heartbeat_expired: false,
+        last_heartbeat: 0n,
+        now: 1n,
+      },
+    },
+    policy: { ok: true, value: {} },
+  } as GuardSnapshot;
+  const otherGuard = "CDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+  const rendered = await render(react.createElement(SetupWizard), oldSnapshot, server);
+  try {
+    assert.equal(step(rendered.container, "initialized")?.dataset.state, "done");
+    await rendered.rerender(oldSnapshot, server, otherGuard);
+    assert.notEqual(step(rendered.container, "initialized")?.dataset.state, "done");
+    assert.notEqual(step(rendered.container, "policy")?.dataset.state, "done");
+
+    await act(async () => {
+      resolveNext?.({ storage: [] });
+      await sleep(20);
+    });
+    assert.equal(step(rendered.container, "initialized")?.dataset.state, "pending");
+  } finally {
+    await rendered.unmount();
+  }
+});
+
+test("retrying a failed initialize read completes the checklist without a write", async () => {
+  window.localStorage.removeItem(SETUP_STORAGE_KEY);
+  let calls = 0;
+  const server = {
+    getContractInstance: async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("temporary RPC failure");
+      return { storage: [{ key: { vec: [{ symbol: "Initialized" }] }, val: { bool: true } }] };
+    },
+  } as typeof noNetworkServer;
+  const verifiedSnapshot = {
+    ...policyMissingSnapshot(),
+    guard: PHASE1_ARTIFACT.guard,
+    status: {
+      ok: true,
+      value: {
+        has_policy: true,
+        admin_frozen: false,
+        heartbeat_expired: false,
+        last_heartbeat: 1n,
+        now: 2n,
+      },
+    },
+    policy: { ok: true, value: POLICY_PRESETS[0]!.config },
+  } as GuardSnapshot;
+  const rendered = await render(
+    react.createElement(SetupWizard),
+    verifiedSnapshot,
+    server,
+    PHASE1_ARTIFACT.guard,
+  );
+  try {
+    assert.equal(step(rendered.container, "initialized")?.dataset.state, "error");
+    await click(rendered.container, "Re-read initialize state (read-only)");
+    assert.equal(step(rendered.container, "initialized")?.dataset.state, "done");
+    assert.equal(calls, 2);
+    assert.equal(window.localStorage.getItem(SETUP_STORAGE_KEY), null);
+  } finally {
+    await rendered.unmount();
+  }
+});
+
+test("a thrown verification timeout clears green state and retry can complete", async () => {
+  window.localStorage.removeItem(SETUP_STORAGE_KEY);
+  let statusReads = 0;
+  let policyReads = 0;
+  let writes = 0;
+  const successfulSimulation = (retval: xdr.ScVal) => {
+    const data = new SorobanDataBuilder()
+      .setReadWrite([])
+      .setResourceFee(0n)
+      .setResources(1_000_000, 0, 0)
+      .build();
+    return {
+      transactionData: new SorobanDataBuilder(data),
+      minResourceFee: "0",
+      result: { auth: [], retval },
+      events: [],
+      latestLedger: 200,
+      cost: { cpuInsns: "0", memBytes: "0" },
+      stateChanges: [],
+    };
+  };
+  const server = {
+    getContractInstance: async () => ({ storage: [] }),
+    simulateTransaction: async (transaction: any) => {
+      const fn = transaction.operations[0].func.invokeContract.functionName.toString();
+      if (fn === "status") {
+        statusReads += 1;
+        if (statusReads === 2) throw new DashboardReadError("temporary status timeout");
+        return successfulSimulation(
+          guardStatusScVal({
+            admin_frozen: false,
+            has_policy: true,
+            heartbeat_expired: false,
+            last_heartbeat: 1n,
+            now: 2n,
+          }),
+        );
+      }
+      if (fn === "policy") {
+        policyReads += 1;
+        return successfulSimulation(policyToScVal(POLICY_PRESETS[0]!.config));
+      }
+      throw new Error(`unexpected read ${fn}`);
+    },
+    prepareTransaction: async () => {
+      writes += 1;
+      throw new Error("verification must not prepare a transaction");
+    },
+    sendTransaction: async () => {
+      writes += 1;
+      throw new Error("verification must not submit a transaction");
+    },
+  } as typeof noNetworkServer;
+  const verifiedSnapshot = {
+    ...policyMissingSnapshot(),
+    guard: PHASE1_ARTIFACT.guard,
+    status: {
+      ok: true,
+      value: {
+        has_policy: true,
+        admin_frozen: false,
+        heartbeat_expired: false,
+        last_heartbeat: 1n,
+        now: 2n,
+      },
+    },
+    policy: { ok: true, value: POLICY_PRESETS[0]!.config },
+  } as GuardSnapshot;
+  const rendered = await render(
+    react.createElement(SetupWizard),
+    verifiedSnapshot,
+    server,
+    PHASE1_ARTIFACT.guard,
+  );
+  try {
+    await click(rendered.container, "Re-verify status & policy (read-only)");
+    assert.equal(step(rendered.container, "verified")?.dataset.state, "done");
+
+    await click(rendered.container, "Re-verify status & policy (read-only)");
+    assert.equal(step(rendered.container, "verified")?.dataset.state, "error");
+
+    await click(rendered.container, "Re-verify status & policy (read-only)");
+    assert.equal(step(rendered.container, "verified")?.dataset.state, "done");
+    assert.equal(statusReads, 3);
+    assert.equal(policyReads, 3);
+    assert.equal(writes, 0);
+    assert.equal(window.localStorage.getItem(SETUP_STORAGE_KEY), null);
+  } finally {
+    await rendered.unmount();
+  }
+});
+
+test("a delayed verification from another guard cannot mark the current guard done", async () => {
+  window.localStorage.removeItem(SETUP_STORAGE_KEY);
+  let resolveStatus: ((value: unknown) => void) | undefined;
+  let resolvePolicy: ((value: unknown) => void) | undefined;
+  const successfulSimulation = (retval: xdr.ScVal) => {
+    const data = new SorobanDataBuilder()
+      .setReadWrite([])
+      .setResourceFee(0n)
+      .setResources(1_000_000, 0, 0)
+      .build();
+    return {
+      transactionData: new SorobanDataBuilder(data),
+      minResourceFee: "0",
+      result: { auth: [], retval },
+      events: [],
+      latestLedger: 200,
+      cost: { cpuInsns: "0", memBytes: "0" },
+      stateChanges: [],
+    };
+  };
+  const serverA = {
+    getContractInstance: async () => ({ storage: [] }),
+    simulateTransaction: async (transaction: any) =>
+      await new Promise((resolve) => {
+        const fn = transaction.operations[0].func.invokeContract.functionName.toString();
+        if (fn === "status") resolveStatus = resolve;
+        else resolvePolicy = resolve;
+      }),
+  } as typeof noNetworkServer;
+  const serverB = {
+    getContractInstance: async () => ({ storage: [] }),
+  } as typeof noNetworkServer;
+  const guardA = PHASE1_ARTIFACT.guard;
+  const guardB = "CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44";
+  const snapshotA = { ...policyMissingSnapshot(), guard: guardA };
+  const snapshotB = {
+    ...policyMissingSnapshot(),
+    guard: guardB,
+    status: {
+      ok: true,
+      value: {
+        has_policy: true,
+        admin_frozen: false,
+        heartbeat_expired: false,
+        last_heartbeat: 1n,
+        now: 2n,
+      },
+    },
+    policy: { ok: true, value: POLICY_PRESETS[0]!.config },
+  } as GuardSnapshot;
+  const rendered = await render(react.createElement(SetupWizard), snapshotA, serverA, guardA);
+  try {
+    await click(rendered.container, "Re-verify status & policy (read-only)");
+    await rendered.rerender(snapshotB, serverB, guardB);
+    assert.equal(step(rendered.container, "verified")?.dataset.state, "pending");
+
+    await act(async () => {
+      resolveStatus?.(
+        successfulSimulation(
+          guardStatusScVal({
+            admin_frozen: false,
+            has_policy: true,
+            heartbeat_expired: false,
+            last_heartbeat: 1n,
+            now: 2n,
+          }),
+        ),
+      );
+      resolvePolicy?.(successfulSimulation(policyToScVal(POLICY_PRESETS[0]!.config)));
+      await sleep(20);
+    });
+    assert.equal(step(rendered.container, "verified")?.dataset.state, "pending");
   } finally {
     await rendered.unmount();
   }

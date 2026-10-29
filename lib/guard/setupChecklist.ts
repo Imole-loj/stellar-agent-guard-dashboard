@@ -111,33 +111,38 @@ function derivePolicy(
   status: ReadResult<GuardStatus>,
   policy: ReadResult<PolicyConfig | null>,
 ): SetupStep {
-  if (status.ok) {
-    const hasPolicy = status.value.has_policy;
+  if (!status.ok || !policy.ok) {
+    const failures = [
+      !status.ok ? `status(): ${status.error}` : null,
+      !policy.ok ? `policy(): ${policy.error}` : null,
+    ].filter((failure): failure is string => failure !== null);
     return {
       id: "policy",
       label: SETUP_STEPS[2]!.label,
-      state: hasPolicy ? "done" : "pending",
-      detail: hasPolicy
-        ? "status() reports a policy in force"
-        : "status() reports no policy — the account is in default-deny and refuses every call",
+      state: "error",
+      detail: `A required chain read failed: ${failures.join("; ")}`,
     };
   }
-  if (policy.ok) {
-    const hasPolicy = policy.value !== null;
+
+  const statusHasPolicy = status.value.has_policy;
+  const policyHasPolicy = policy.value !== null;
+  if (statusHasPolicy !== policyHasPolicy) {
     return {
       id: "policy",
       label: SETUP_STEPS[2]!.label,
-      state: hasPolicy ? "done" : "pending",
-      detail: hasPolicy
-        ? "policy() returned a policy, though status() could not be read"
-        : "policy() returned none — the account is in default-deny",
+      state: "error",
+      detail:
+        "status() and policy() returned inconsistent results; re-read the chain before continuing",
     };
   }
+
   return {
     id: "policy",
     label: SETUP_STEPS[2]!.label,
-    state: "error",
-    detail: `status() and policy() could not be read: ${status.error}`,
+    state: statusHasPolicy ? "done" : "pending",
+    detail: statusHasPolicy
+      ? "status() and policy() both report a policy in force"
+      : "status() and policy() both report no policy — the account is in default-deny and refuses every call",
   };
 }
 

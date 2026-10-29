@@ -79,6 +79,12 @@ import { ErrorBlock, OutcomeList, starLink } from "./bits.tsx";
 /** Either the chain's answer about the artifact, or why there is not one. */
 type ArtifactFetch = { artifact: ArtifactCheck } | { error: string };
 
+type PredictedInspection =
+  | { address: string; state: "checking" }
+  | { address: string; state: "available" }
+  | { address: string; state: "existing"; integrity: IntegrityReport | null; error: string | null }
+  | { address: string; state: "error"; error: string };
+
 // parked-until-upstream: #13
 // The multi-artifact version picker is blocked until the upstream stellar-agent-guard-contracts
 // repository lands its release-workflow and publishes its first versioned artifact, and the SDK
@@ -104,13 +110,6 @@ export function DeployPanel() {
   const [error, setError] = useState<string | null>(null);
   const [agentPubkey, setAgentPubkey] = useState("");
   const [initResult, setInitResult] = useState<InvokeResult | null>(null);
-  // Deploy is a write like any other: available to a connected admin, inert and
-  // self-explanatory to an observer (#101).
-  const deployControl = writeControlState(wallet, {
-    busy: deploying,
-    extraDisabled: artifact?.ok !== true,
-    label: "deploy a guard",
-  });
 
   // The salt can be typed as well as rolled. `salt` stays the bytes that will
   // actually be deployed, and the text box is only its presentation, so the
@@ -131,9 +130,7 @@ export function DeployPanel() {
   // re-renders without becoming state.
   const cancelSearch = useRef({ aborted: false });
 
-  const [collision, setCollision] = useState<{ exists: boolean; detail: string | null } | null>(
-    null,
-  );
+  const [predictedInspection, setPredictedInspection] = useState<PredictedInspection | null>(null);
 
   const [balances, setBalances] = useState<BalanceReading[] | null>(null);
   const [checkingBalance, setCheckingBalance] = useState(false);
@@ -282,15 +279,56 @@ export function DeployPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [server, wallet, salt, planKey, predictionProblem]);
 
-  // Asked whether the predicted address is already taken, because the salt is
-  // deterministic: reusing one from an earlier deployment is a collision the
-  // chain would only report at signing time.
+  // Inspect the predicted address before enabling deploy. Lookup failures do not
+  // mean the address is free, and an existing instance is read-only inspected.
   const predicted = plan?.predicted ?? "";
+  const currentPredictedInspection: PredictedInspection | null =
+    predicted === ""
+      ? null
+      : predictedInspection?.address === predicted
+        ? predictedInspection
+        : { address: predicted, state: "checking" };
+  const deployControl = writeControlState(wallet, {
+    busy: deploying,
+    extraDisabled: artifact?.ok !== true || currentPredictedInspection?.state !== "available",
+    label: "deploy a guard",
+  });
   useEffect(() => {
     let cancelled = false;
+    if (predicted === "") return;
     void (async () => {
-      const next = predicted === "" ? null : await contractAlreadyDeployed(server, predicted);
-      if (!cancelled) setCollision(next);
+      const lookup = await contractAlreadyDeployed(server, predicted);
+      if (cancelled) return;
+      if (lookup.error) {
+        setPredictedInspection({ address: predicted, state: "error", error: lookup.error });
+        return;
+      }
+      if (!lookup.exists) {
+        setPredictedInspection({ address: predicted, state: "available" });
+        return;
+      }
+
+      try {
+        const [wasm, identity] = await Promise.all([
+          fetchContractWasm(server, predicted),
+          verifyWasmIdentity(server, predicted),
+        ]);
+        const integrity = await buildIntegrityReport({
+          wasm,
+          reportedWasmHash: identity.reportedWasmHash,
+        });
+        if (!cancelled)
+          setPredictedInspection({ address: predicted, state: "existing", integrity, error: null });
+      } catch (caught) {
+        if (!cancelled) {
+          setPredictedInspection({
+            address: predicted,
+            state: "existing",
+            integrity: null,
+            error: caught instanceof Error ? caught.message : String(caught),
+          });
+        }
+      }
     })();
     return () => {
       cancelled = true;
@@ -668,13 +706,45 @@ export function DeployPanel() {
         </div>
       )}
 
-      {collision?.exists && (
+      {currentPredictedInspection?.state === "checking" && (
+        <p className="tiny muted" role="status">
+          Checking {predicted} on {NETWORK.name} before enabling deployment…
+        </p>
+      )}
+      {currentPredictedInspection?.state === "available" && (
+        <p className="tiny muted" role="status">
+          Fresh read on {NETWORK.name}: no instance exists at this address.
+        </p>
+      )}
+      {currentPredictedInspection?.state === "error" && (
         <div className="error" role="alert" style={{ marginTop: 8 }}>
-          <span className="t">Address already taken</span>
+          <strong>Predicted address could not be checked</strong>
           <span className="tiny">
-            A contract already lives at {predicted}. Generate a new salt or choose another before
-            signing — the deploy would fail on collision rather than overwrite anything.
+            {currentPredictedInspection.error} Deployment stays disabled until the chain confirms
+            whether this address is free.
           </span>
+        </div>
+      )}
+      {currentPredictedInspection?.state === "existing" && (
+        <div className="error" role="alert" style={{ marginTop: 8 }}>
+          <strong>Address already exists on {NETWORK.name}</strong>
+          <span className="tiny">
+            No create transaction will be submitted for this address. Change the deployer or salt to
+            derive a new address before deploying again.
+          </span>
+          {currentPredictedInspection.integrity ? (
+            <>
+              <strong>{currentPredictedInspection.integrity.headline}</strong>
+              <span className="tiny">
+                Bytecode verification: {currentPredictedInspection.integrity.verdict} against the
+                pinned artifact. {currentPredictedInspection.integrity.detail}
+              </span>
+            </>
+          ) : (
+            <span className="tiny">
+              Bytecode verification could not be completed: {currentPredictedInspection.error}
+            </span>
+          )}
         </div>
       )}
 
@@ -814,7 +884,7 @@ export function DeployPanel() {
 
       {wallet && plan && deployCost && (
         <div className={deployCost.warning ? "error" : "notice info"} style={{ marginTop: 12 }}>
-          <strong>Deployment reserve check</strong>
+          <strong>Deployment reserve estimate</strong>
           <div
             className="tiny"
             style={{
@@ -825,24 +895,36 @@ export function DeployPanel() {
             }}
           >
             <div>
-              <div className="tiny muted">Base tx fee</div>
-              <div className="mono">{deployCost.baseFeeXlm} XLM</div>
+              <div className="tiny muted">Base tx fee (estimate)</div>
+              <div className="mono">
+                {deployCost.baseFeeXlm} XLM ({deployCost.baseFeeXlmToStroops} stroops)
+              </div>
             </div>
             <div>
-              <div className="tiny muted">WASM upload</div>
-              <div className="mono">{deployCost.wasmUploadFeeXlm} XLM</div>
+              <div className="tiny muted">WASM upload (estimate)</div>
+              <div className="mono">
+                {deployCost.wasmUploadFeeXlm} XLM ({deployCost.wasmUploadFeeXlmToStroops} stroops)
+              </div>
             </div>
             <div>
-              <div className="tiny muted">Contract instance</div>
-              <div className="mono">{deployCost.contractInstanceFeeXlm} XLM</div>
+              <div className="tiny muted">Contract instance (estimate)</div>
+              <div className="mono">
+                {deployCost.contractInstanceFeeXlm} XLM (
+                {deployCost.contractInstanceFeeXlmToStroops} stroops)
+              </div>
             </div>
             <div>
-              <div className="tiny muted">Initial rent</div>
-              <div className="mono">{deployCost.initialRentDepositXlm} XLM</div>
+              <div className="tiny muted">Initial rent (estimate)</div>
+              <div className="mono">
+                {deployCost.initialRentDepositXlm} XLM ({deployCost.initialRentDepositXlmToStroops}{" "}
+                stroops)
+              </div>
             </div>
             <div>
-              <div className="tiny muted">Required total</div>
-              <div className="mono">{deployCost.totalRequiredXlm} XLM</div>
+              <div className="tiny muted">Required total (estimate)</div>
+              <div className="mono">
+                {deployCost.totalRequiredXlm} XLM ({deployCost.totalRequiredXlmToStroops} stroops)
+              </div>
             </div>
             <div>
               <div className="tiny muted">Wallet balance</div>
@@ -861,6 +943,12 @@ export function DeployPanel() {
                 7,
               )}{" "}
               XLM before signing.
+            </div>
+          )}
+          {/* Source note: fees are estimates based on network conditions and may vary at signing time */}
+          {deployCost.sourceNote && (
+            <div className="tiny" style={{ marginTop: 8, color: "var(--warn)" }}>
+              {deployCost.sourceNote}
             </div>
           )}
         </div>

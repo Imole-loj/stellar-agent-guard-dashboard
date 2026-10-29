@@ -36,6 +36,7 @@ import {
 import { addressToScVal, hexToBytes } from "./scval.ts";
 import { announce } from "./useAnnounce.ts";
 import { recordTx } from "./txHistory.ts";
+import { contractAlreadyDeployed } from "./saltGenerator.ts";
 
 // ── Artifact identity ──────────────────────────────────────────────────────
 
@@ -319,6 +320,23 @@ export class GuardOperationError extends Error {
   }
 }
 
+async function assertDeploymentAddressAvailable(
+  server: rpc.Server,
+  address: string,
+): Promise<void> {
+  const lookup = await contractAlreadyDeployed(server, address);
+  if (lookup.error) {
+    throw new GuardOperationError(
+      `could not inspect predicted address ${address}: ${lookup.error}; refusing to deploy`,
+    );
+  }
+  if (lookup.exists) {
+    throw new GuardOperationError(
+      `predicted address ${address} already exists; change the deployer or salt before deploying again`,
+    );
+  }
+}
+
 /**
  * Deploy a new guard instance of the pinned Phase 1 artifact.
  *
@@ -343,14 +361,15 @@ export async function deployGuard(params: {
     params.onStep?.(step);
   };
 
-  const artifact = await checkArtifact(server);
-  if (!artifact.ok) throw new GuardOperationError(artifact.detail);
-
   const predicted = await predictContractId({
     deployerPublicKey: signer.address,
     salt,
     ...(params.passphrase !== undefined ? { passphrase: params.passphrase } : {}),
   });
+  await assertDeploymentAddressAvailable(server, predicted);
+
+  const artifact = await checkArtifact(server);
+  if (!artifact.ok) throw new GuardOperationError(artifact.detail);
 
   // ── Ensure the exact bytecode is a live code entry ─────────────────────
   const present = await artifactCodePresent(server, PHASE1_ARTIFACT.wasmHash);
@@ -376,6 +395,7 @@ export async function deployGuard(params: {
     }
   }
 
+  await assertDeploymentAddressAvailable(server, predicted);
   const create = await submitOperation({
     server,
     signer,

@@ -87,6 +87,7 @@ type PolicyOutcome =
  * produced for, so it can only ever be spent on that guard.
  */
 type PolicyApproval = ScopeBound<{ draft: PolicyDraft; diff: PolicyDiff | null }>;
+type PolicyImportApproval = ScopeBound<PolicyDraft>;
 
 /** Speak a policy write's outcome, with the reason when it did not land. */
 function speakPolicy(operation: PolicyOperation, reason: string, guard?: string): void {
@@ -184,6 +185,7 @@ export function PolicyForm() {
   // confirmation dialog applies it. The draft is never replaced by a stray
   // change event on the select.
   const [pendingPreset, setPendingPreset] = useState<PolicyPreset | null>(null);
+  const [pendingPolicyImport, setPendingPolicyImport] = useState<PolicyImportApproval | null>(null);
   // ── Which guard everything on this form belongs to ──────────────────────
   // The active guard is shared application context: the operator, another tab or
   // a link can change it while a draft, an approval or a write is still live.
@@ -213,9 +215,11 @@ export function PolicyForm() {
     setOutcome(null);
     setError(null);
     setPendingPreset(null);
+    setPendingPolicyImport(null);
     setAssetCapChanges({});
   }
   const approval = valueInScope(pendingApproval, activeScope);
+  const policyImportApproval = valueInScope(pendingPolicyImport, activeScope);
 
   /** Replace the draft. Refused while the draft belongs to another guard. */
   function setDraft(next: PolicyDraft | null) {
@@ -484,7 +488,7 @@ export function PolicyForm() {
   }
 
   function exportPolicyJson() {
-    const result = exportPolicyDraft(effective);
+    const result = exportPolicyDraft(effective, NETWORK.name);
     if (!result.ok) {
       setError(`Policy export failed: ${result.issues.map((issue) => issue.message).join("; ")}`);
       return;
@@ -496,7 +500,7 @@ export function PolicyForm() {
   async function importPolicyJson(file: File) {
     try {
       const source = await file.text();
-      const result = importPolicyFromJson(source);
+      const result = importPolicyFromJson(source, NETWORK.name);
       if (!result.ok) {
         const detail = result.issues
           .map((issue) => (issue.path ? `${issue.path}: ${issue.message}` : issue.message))
@@ -505,10 +509,12 @@ export function PolicyForm() {
         toast.error("Policy import failed", { message: detail });
         return;
       }
-      setDraft(result.draft);
-      setAssetCapChanges({});
+      setPendingPolicyImport(bindToScope(activeScope, result.draft));
       setError(null);
-      toast.success("Policy imported", "Loaded into the form below -- review before signing.");
+      toast.success(
+        "Policy file validated",
+        "Review the preview before applying it to the unsaved form.",
+      );
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : String(caught);
       setError(`Policy import failed: ${message}`);
@@ -1264,6 +1270,45 @@ export function PolicyForm() {
           Load installed
         </button>
       </div>
+
+      {policyImportApproval && (
+        <div className="modal-backdrop">
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="policy-import-preview-title"
+          >
+            <strong id="policy-import-preview-title">Preview imported policy draft</strong>
+            <p className="tiny">
+              This file targets the <strong>{NETWORK.name}</strong> network and passed schema and
+              identifier validation. Applying it only replaces the editable form; it does not
+              install a policy or change on-chain state.
+            </p>
+            <p className="tiny mono">{describeDraft(policyImportApproval)}</p>
+            <p className="tiny muted">
+              The draft remains unsaved until you complete the normal validation, simulation, wallet
+              signing and post-write chain read.
+            </p>
+            <div className="row">
+              <button
+                onClick={() => {
+                  setDraft(policyImportApproval);
+                  setAssetCapChanges({});
+                  setError(null);
+                  setPendingPolicyImport(null);
+                  toast.success("Policy draft applied", "Review it in the form before installing.");
+                }}
+              >
+                Apply to form
+              </button>
+              <button className="secondary" onClick={() => setPendingPolicyImport(null)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {pendingPreset && (
         <div className="modal-backdrop">

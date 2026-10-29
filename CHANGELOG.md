@@ -10,6 +10,8 @@ derived from [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.
 
 ### Features
 
+- **policy**: include network identity and preview imports before applying a draft (Closes #298)
+
 - **guard**: add rotateAgentKey operation function (`552f76b`)
 - **scripts**: read-only instance inspector (`e4e55b6`)
 - **ui**: deploy and configure page (`f8f7a08`)

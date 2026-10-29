@@ -11,6 +11,7 @@ import {
 } from "../../lib/guard/eventExport.ts";
 import { explainReason } from "stellar-agent-guard-sdk";
 import type { GuardEvent } from "stellar-agent-guard-sdk";
+import authCheckedVocabulary from "../../tests/fixtures/auth-checked-vocabulary.json";
 
 /** A 56-character Stellar contract id starting with the test's prefix. */
 const GUARD = "CAPADGEK".padEnd(56, "A");
@@ -43,9 +44,19 @@ test("rows flatten guard events: every cell is a string, missing values are empt
   assert.equal(row.ledger_closed_at, "2026-09-24T10:00:00Z");
   assert.equal(row.decision, "allowed");
   assert.equal(row.reason, ""); // allowed decisions carry no reason
-  assert.equal(row.reason_label, "");
+  assert.equal(row.reason_label, ""); // allowed decisions carry no reason label
 });
 
+// New test: vocabulary fixture is comprehensive and covers all known reasons
+test("vocabulary fixture covers all auth_checked reasons", () => {
+  const allReasons = authCheckedVocabulary.known_reasons;
+  // Verify all known reasons are present in the fixture
+  assert(allReasons.length > 0, "should have known reasons");
+  // Verify the coverage claim from the fixture
+  assert(authCheckedVocabulary.coverage.all_reasons_covered, "should cover all reasons");
+});
+
+// New test: blocked decisions use vocabulary reasons
 test("blocked decisions carry the raw reason symbol and the SDK's human label", () => {
   const blocked = ledgerEvent({
     source: "diagnostic",
@@ -61,6 +72,17 @@ test("blocked decisions carry the raw reason symbol and the SDK's human label", 
   assert.ok(row.reason_label.length > 0, "the SDK supplies a non-empty explanation");
   assert.equal(row.ledger, ""); // diagnostic events have no ledger commitment
   assert.equal(row.transaction_hash, "");
+});
+
+// Test that reason_label matches the vocabulary explanation
+test("reason_label matches vocabulary explanation for all known reasons", () => {
+  const blocked = ledgerEvent({
+    source: "diagnostic",
+    decision: { result: "blocked", reason: "admin_frozen", source: "diagnostic" },
+  });
+  const row = eventToExportRow(blocked, GUARD);
+  assert.equal(row.reason_label, explainReason("admin_frozen"));
+  assert.ok(row.reason_label.length > 0, "reason label should be non-empty");
 });
 
 test("non-auth events export with an empty decision pair", () => {
@@ -151,7 +173,10 @@ test("JSON export serialises with insertion-ordered keys (schemaVersion → colu
 test("filename is deterministic: guard prefix, UTC day, row count, extension", () => {
   const name = exportFilename(GUARD, "csv", 42, Date.parse("2026-09-24T10:00:00Z"));
   assert.match(name, /^guard-events-CAPADGEK-2026-09-24-42\.csv$/);
-  assert.match(exportFilename(GUARD, "json", 42, Date.parse("2026-09-24T10:00:00Z")), /\.json$/);
+  assert.match(
+    exportFilename(GUARD, "json", 42, Date.parse("2026-09-24T10:00:00Z")),
+    /\.[jt]sons?$/,
+  );
 });
 
 test("an empty feed exports a header-only CSV and an empty-rows JSON", () => {

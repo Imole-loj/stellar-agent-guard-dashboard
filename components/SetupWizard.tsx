@@ -76,6 +76,39 @@ export function SetupWizard() {
         : initializedRead,
     [demo, initializedRead],
   );
+  // Which guard the recovery was confirmed under, or null when this guard has
+  // not recovered yet — keying it the same way the read above is keyed, so
+  // leaving a guard cannot leave its recovery ticked on the next one.
+  const [recoveredState, setRecoveredState] = useState<{ guard: string } | null>(null);
+  const initializedRecovered = recoveredState?.guard === guard;
+  // `recoverInitialized` forces a fresh read from the chain to recover the
+  // initialized state after a refresh, ensuring the operator explicitly
+  // confirms the guard's initialization status rather than relying on a
+  // potentially stale snapshot. It writes through the same guard-keyed state
+  // the mount effect and the read-only retry use, and is bound to the guard it
+  // started under so a late answer for a guard the operator has left is
+  // discarded rather than rendering as this guard's state.
+  const recoverInitialized = useCallback(async () => {
+    const target = guard;
+    setInitializedState({
+      guard: target,
+      value: { ok: false, error: "reading initialize state…" },
+    });
+    setRecoveredState(null);
+    try {
+      const value = await isInitialized(server, target);
+      setInitializedState({ guard: target, value: { ok: true, value } });
+      setRecoveredState({ guard: target });
+    } catch (error) {
+      setInitializedState({
+        guard: target,
+        value: {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+  }, [server, guard]);
 
   // The one read this component performs on its own, in its console shape.
   // Shared by the mount effect and the read-only retry button, so the retry
@@ -126,20 +159,23 @@ export function SetupWizard() {
     };
   }, [guard, demo, fetchInitialized]);
 
+  const activeSnapshot = snapshot?.guard === guard ? snapshot : null;
+
   const steps = useMemo(
     () =>
       deriveSetupSteps({
         deployedMarker,
         initialized,
-        status: snapshot?.status ?? { ok: false, error: "Reading the chain…" },
-        policy: snapshot?.policy ?? { ok: false, error: "Reading the chain…" },
+        status: activeSnapshot?.status ?? { ok: false, error: "Reading the chain…" },
+        policy: activeSnapshot?.policy ?? { ok: false, error: "Reading the chain…" },
         verified,
       }),
-    [deployedMarker, initialized, snapshot, verified],
+    [deployedMarker, initialized, activeSnapshot, verified],
   );
 
   const verify = useCallback(async () => {
     setVerifying(true);
+    setVerification({ guard, value: null });
     try {
       // A live re-read, not the polled snapshot: the point of the step is that
       // the operator asked the chain right now. It reads `status()` and
@@ -156,6 +192,14 @@ export function SetupWizard() {
           guard,
           value: { ok: true, value: { hasPolicy: status.value.has_policy } },
         });
+    } catch (error) {
+      setVerification({
+        guard,
+        value: {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
     } finally {
       setVerifying(false);
     }
@@ -247,6 +291,15 @@ export function SetupWizard() {
           the only way to know it has run — <span className="mono">status()</span> does not expose
           it.
         </p>
+      )}
+      {!initializedRecovered && (
+        <button
+          className="secondary"
+          onClick={() => void recoverInitialized()}
+          style={{ marginTop: 8 }}
+        >
+          Recover initialize state after refresh
+        </button>
       )}
 
       {verified && !verified.ok && (

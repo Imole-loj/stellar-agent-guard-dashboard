@@ -413,12 +413,23 @@ test("a salt reused from an earlier deploy is caught before signing", async () =
   const free = await contractAlreadyDeployed(
     {
       getContractInstance: async () => {
-        throw new Error("not found");
+        throw Object.assign(new Error("not found"), { code: 404 });
       },
     },
     guard,
   );
   assert.deepEqual(free, { exists: false, detail: null });
+
+  const unavailable = await contractAlreadyDeployed(
+    {
+      getContractInstance: async () => {
+        throw Object.assign(new Error("RPC unavailable"), { code: 503 });
+      },
+    },
+    guard,
+  );
+  assert.equal(unavailable.exists, false);
+  assert.match(unavailable.error ?? "", /RPC unavailable/);
 });
 
 test("an address that has not been derived yet is not a collision", async () => {
