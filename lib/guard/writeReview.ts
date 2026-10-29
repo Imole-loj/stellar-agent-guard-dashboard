@@ -111,6 +111,52 @@ export async function revalidateWallet(params: {
   }
 }
 
+/**
+ * Whether an imported envelope may still be broadcast after the wallet moved
+ * (issue #349).
+ *
+ * The review of a pasted envelope names one account: the source it was checked
+ * against. A wallet that has since connected as somebody else means the
+ * operator is no longer looking at the account they reviewed, so the broadcast
+ * stops and the review starts again — the same rule every other write surface
+ * follows, applied to the one surface that does not ask this console for a
+ * signature.
+ *
+ * `liveAddress` is `undefined` when no wallet is connected at all: this panel
+ * has always been able to hand an externally signed envelope to the network
+ * unattended, and that is unchanged here. `null` means a wallet was connected
+ * and its provider has since gone away.
+ */
+export type ReviewedAccountCheck = { ok: true } | { ok: false; message: string };
+
+export function reviewedAccountCheck(params: {
+  /** The source account the review was built against. */
+  reviewedSource: string;
+  /** The wallet's live address; `undefined` when no wallet is connected. */
+  liveAddress?: string | null | undefined;
+}): ReviewedAccountCheck {
+  const { reviewedSource, liveAddress } = params;
+  if (liveAddress === undefined) return { ok: true };
+  if (liveAddress === null) {
+    return {
+      ok: false,
+      message:
+        "The wallet disconnected after this envelope was reviewed. Reconnect it and check " +
+        "the envelope again before broadcasting — nothing was sent.",
+    };
+  }
+  if (liveAddress !== reviewedSource) {
+    return {
+      ok: false,
+      message:
+        `The wallet is on ${shortAddress(liveAddress)}, but this envelope was reviewed for ` +
+        `${shortAddress(reviewedSource)}. Nothing was broadcast — switch the wallet back and ` +
+        `run a fresh review.`,
+    };
+  }
+  return { ok: true };
+}
+
 /** The interruption an error represents at `phase`, or null when it is unrelated. */
 export function asWriteInterruption(error: unknown, phase: WritePhase): WriteInterruption | null {
   if (error instanceof WriteInterruptionError) return error.interruption;

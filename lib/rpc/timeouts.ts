@@ -103,3 +103,135 @@ export function buildReadDiagnostic(input: {
     ].join("\n"),
   };
 }
+
+// ── Read-only endpoint health (issue #346) ───────────────────────────────
+
+/** How long one endpoint health probe waits for an answer. */
+export const RPC_PROBE_TIMEOUT_MS = 4_000;
+
+/** Why a probe did not come back with a healthy endpoint. */
+export type RpcHealthFailure =
+  /** Connected, but no complete answer arrived before the deadline. */
+  | "timeout"
+  /** An answer that is not the JSON-RPC health shape this console reads. */
+  | "malformed"
+  /** A non-2xx status: the provider is there but not serving this endpoint. */
+  | "unavailable"
+  /** No HTTP answer at all — DNS, TLS, offline, a blocked request. */
+  | "network";
+
+export interface RpcHealthProbe {
+  /** The endpoint's origin only: never a token, a path or a userinfo pair. */
+  endpointOrigin: string;
+  /** Milliseconds from request to answer, or to the moment it was given up on. */
+  latencyMs: number;
+}
+
+export type RpcHealthResult =
+  | (RpcHealthProbe & {
+      ok: true;
+      /** The `status` the endpoint reported, verbatim. */
+      status: string;
+    })
+  | (RpcHealthProbe & {
+      ok: false;
+      failure: RpcHealthFailure;
+      /** Operator-safe wording, redacted like every other diagnostic here. */
+      detail: string;
+    });
+
+export interface RpcProbeOptions {
+  timeoutMs?: number;
+  /** Injected for tests; defaults to the global `fetch`. */
+  fetchImpl?: typeof fetch;
+  /** Injected clock, so a test can measure latency without a real wait. */
+  now?: () => number;
+}
+
+/** Read `result.status` out of a JSON-RPC answer, or null when it is not there. */
+function readHealthStatus(payload: unknown): string | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const result = (payload as { result?: unknown }).result;
+  if (typeof result !== "object" || result === null) return null;
+  const status = (result as { status?: unknown }).status;
+  return typeof status === "string" && status !== "" ? status : null;
+}
+
+/**
+ * Ask the configured endpoint whether it is alive, and time the round trip.
+ *
+ * `getHealth` is the read-only, argument-free call in the JSON-RPC
+ * vocabulary: no account, no signature, no wallet — the body is a method name
+ * and an id, so a probe can never carry operator material to a provider (issue
+ * #346). It reports only the endpoint's *origin* (see `sanitizeEndpointOrigin`,
+ * which drops any token in the query string or userinfo) and the latency.
+ *
+ * Deliberately says nothing about a guard: a healthy endpoint means the
+ * provider answered, not that a contract is well. Chain state stays the
+ * authority for that, read the way the panels read it.
+ */
+export async function probeRpcHealth(
+  endpoint: string,
+  options: RpcProbeOptions = {},
+): Promise<RpcHealthResult> {
+  const endpointOrigin = sanitizeEndpointOrigin(endpoint);
+  const timeoutMs = options.timeoutMs ?? RPC_PROBE_TIMEOUT_MS;
+  const now = options.now ?? Date.now;
+  const doFetch: typeof fetch =
+    options.fetchImpl ?? ((input, init) => globalThis.fetch(input, init));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const started = now();
+  const elapsed = (): number => Math.max(0, now() - started);
+
+  try {
+    const response = await doFetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getHealth" }),
+      signal: controller.signal,
+    });
+    const latencyMs = elapsed();
+    if (!response.ok) {
+      return {
+        ok: false,
+        endpointOrigin,
+        latencyMs,
+        failure: "unavailable",
+        detail: `the endpoint answered HTTP ${response.status}`,
+      };
+    }
+    const payload: unknown = await response.json().catch(() => null);
+    const status = readHealthStatus(payload);
+    if (status === null) {
+      return {
+        ok: false,
+        endpointOrigin,
+        latencyMs,
+        failure: "malformed",
+        detail: "the endpoint answered, but not with a health record",
+      };
+    }
+    return { ok: true, endpointOrigin, latencyMs, status };
+  } catch (error) {
+    if (controller.signal.aborted) {
+      return {
+        ok: false,
+        endpointOrigin,
+        latencyMs: elapsed(),
+        failure: "timeout",
+        detail: `no answer within ${timeoutMs}ms`,
+      };
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      endpointOrigin,
+      latencyMs: elapsed(),
+      failure: "network",
+      detail: redactDiagnosticText(message),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}

@@ -78,10 +78,17 @@ import {
   defaultGuard,
   loadInstances,
   removeInstance as removeSavedInstance,
+  removeInstances as removeSavedInstancesBulk,
   renameInstance as renameSavedInstance,
   type GuardInstance,
 } from "../lib/guard/instance.ts";
-import { addGuard, fallbackAfterRemoval, registryAfterChange } from "../lib/guard/registry.ts";
+import {
+  addGuard,
+  fallbackAfterRemoval,
+  registryAfterChange,
+  restoreRegistryBackup,
+  type RegistryBackup,
+} from "../lib/guard/registry.ts";
 import { readStatus, readPolicy, readWindow, verifyWasmIdentity } from "../lib/guard/chain.ts";
 import { currentAddress, freighterSigner, type ConnectedWallet } from "../lib/guard/wallet.ts";
 import {
@@ -205,6 +212,14 @@ export interface GuardContextValue {
   addInstance: (guard: string, label: string) => Promise<{ ok: boolean; error?: string }>;
   /** Delete an operator-saved guard, clearing the state scoped to it. */
   removeInstance: (guard: string) => void;
+  /**
+   * Remove several saved guards in one write (#302), clearing the state scoped
+   * to each one that really left the registry. Resolves `true` only when the
+   * write landed, so a caller can offer an undo for a change that happened.
+   */
+  removeInstances: (guards: readonly string[]) => boolean;
+  /** Merge a backup of the registry back in — the one-step undo of a cleanup. */
+  restoreRegistry: (backup: RegistryBackup) => void;
   /** Rename a saved guard (a known instance gets a saved override). */
   renameInstance: (guard: string, label: string) => void;
   snapshot: GuardSnapshot | null;
@@ -1059,6 +1074,85 @@ export function GuardProvider({
     [instances, guard, tabSync, dropFeedState, announceRegistry],
   );
 
+  /**
+   * Remove several saved guards in one reviewed write (#302).
+   *
+   * The cascade a single removal performs runs for every address that really
+   * left the registry, and the active guard moves to the first remaining one
+   * when it was among them — the same fallback a single delete takes, so a bulk
+   * cleanup never leaves the selector pointing at an address that is gone.
+   *
+   * A write that did not land leaves the selector exactly as it was and says
+   * so: the console must never display a registry that storage disagrees with.
+   */
+  const removeInstances = useCallback(
+    (targets: readonly string[]) => {
+      const result = removeSavedInstancesBulk(targets);
+      if (!result.ok) {
+        announce("The registry change could not be saved — nothing was removed", "assertive");
+        return false;
+      }
+      const removed = result.removed;
+      if (removed.length === 0) return false;
+      const removedSet = new Set(removed);
+      for (const target of removed) {
+        const entry = instances.find((instance) => instance.guard === target);
+        clearGuardScopedState(entry?.network ?? NETWORK.name, target);
+        announceRegistry("remove", target);
+      }
+      setInstances(result.instances);
+      if (removedSet.has(guard)) {
+        const fallback = result.instances[0]?.guard ?? defaultGuard();
+        readEpochRef.current += 1;
+        setGuard(fallback);
+        setSnapshot(null);
+        setSnapshotError(null);
+        setBuffer(emptyStreamBuffer());
+        setRangeLabel(null);
+        dropFeedState();
+        tabSync.broadcast("GUARD_CHANGED", { guard: fallback });
+      }
+      return true;
+    },
+    [instances, guard, tabSync, dropFeedState, announceRegistry],
+  );
+
+  /**
+   * Merge a cleanup's backup into the stored registry — its one-step undo.
+   *
+   * Entries the cleanup removed come back (and are announced, so another tab
+   * re-reads), and the operator returns to the account they were on when the
+   * backup was taken if the cleanup had moved them off it.
+   */
+  const restoreRegistry = useCallback(
+    (backup: RegistryBackup) => {
+      const result = restoreRegistryBackup(backup);
+      if (!result.ok) {
+        announce(result.error ?? "The previous registry could not be restored.", "assertive");
+        return;
+      }
+      const cameBack = backup.entries.filter(
+        (entry) => !instances.some((instance) => instance.guard === entry.guard),
+      );
+      for (const entry of cameBack) announceRegistry("add", entry.guard);
+      setInstances(result.instances);
+      const active = backup.activeGuard;
+      if (active !== "" && active !== guard) {
+        if (!result.instances.some((instance) => instance.guard === active)) return;
+        readEpochRef.current += 1;
+        setGuard(active);
+        setSnapshot(null);
+        setSnapshotError(null);
+        setBuffer(emptyStreamBuffer());
+        setRangeLabel(null);
+        dropFeedState();
+        tabSync.broadcast("GUARD_CHANGED", { guard: active });
+      }
+      announce("Restored the registry as it was before the cleanup");
+    },
+    [instances, guard, tabSync, dropFeedState, announceRegistry],
+  );
+
   const renameInstance = useCallback(
     (target: string, label: string) => {
       setInstances(renameSavedInstance(target, label));
@@ -1485,6 +1579,8 @@ export function GuardProvider({
       selectGuard,
       addInstance,
       removeInstance,
+      removeInstances,
+      restoreRegistry,
       renameInstance,
       snapshot,
       lastRefresh,
@@ -1533,6 +1629,8 @@ export function GuardProvider({
       selectGuard,
       addInstance,
       removeInstance,
+      removeInstances,
+      restoreRegistry,
       renameInstance,
       snapshot,
       snapshotError,

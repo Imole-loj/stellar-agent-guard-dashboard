@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
+import { GUARD_WASM_HASH, verifyGuardWasm } from "stellar-agent-guard-sdk";
 import { PHASE1_ARTIFACT } from "../../lib/guard/network.ts";
 import {
   buildIntegrityReport,
@@ -79,11 +80,6 @@ function wasmModule(sections: number[][]): Uint8Array {
 
 const PINNED = { wasmHash: "f".repeat(64), wasmBytes: 39673 };
 const OTHER = "a".repeat(64);
-
-/** The digest is injected, so a report can be driven without hashing anything. */
-function digestOf(hex: string) {
-  return async () => hex;
-}
 
 function okInspection(inspection: WasmInspection) {
   assert.equal(inspection.ok, true, inspection.ok ? "" : inspection.reason);
@@ -246,15 +242,15 @@ test("a producers section whose data starts before the name is not misread", () 
 
 test("the pinned artifact is declared verified against two independent claims", async () => {
   const wasm = wasmModule([exportSection([exportEntry("check", 0, 1)])]);
+  const hash = await sha256Hex(wasm);
   const report = await buildIntegrityReport({
     wasm,
-    reportedWasmHash: PINNED.wasmHash,
-    pinned: PINNED,
-    digest: digestOf(PINNED.wasmHash),
+    reportedWasmHash: hash,
+    pinned: { wasmHash: hash, wasmBytes: PINNED.wasmBytes },
   });
   assert.equal(report.verdict, "verified");
   assert.equal(report.headline, "VERIFIED BUILD");
-  assert.equal(report.sha256, PINNED.wasmHash);
+  assert.equal(report.sha256, hash);
   assert.equal(report.pinnedBytes, 39673);
   assert.deepEqual(report.entrypoints, ["check"]);
   assert.match(report.detail, /pinned Phase 1 artifact/);
@@ -262,32 +258,29 @@ test("the pinned artifact is declared verified against two independent claims", 
 
 test("bytes that are not the pinned artifact are called unrecognized", async () => {
   const wasm = wasmModule([exportSection([exportEntry("check", 0, 1)])]);
-  const report = await buildIntegrityReport({ wasm, pinned: PINNED, digest: digestOf(OTHER) });
+  const actual = await sha256Hex(wasm);
+  const report = await buildIntegrityReport({ wasm, pinned: PINNED });
   assert.equal(report.verdict, "unrecognized");
   assert.equal(report.headline, "UNRECOGNIZED BYTECODE");
-  assert.ok(report.detail.includes(`${OTHER.slice(0, 16)}…`));
+  assert.ok(report.detail.includes(`${actual.slice(0, 16)}…`));
   assert.ok(report.detail.includes(`pinned build is ${PINNED.wasmBytes}`));
   // A ledger that agrees with us on a hash we do not recognise is not a pass.
   assert.equal(report.reportedWasmHash, null);
 });
 
 test("a ledger hash that disagrees with the fetched bytes blocks verification", async () => {
+  const wasm = wasmModule([]);
   const report = await buildIntegrityReport({
-    wasm: wasmModule([]),
+    wasm,
     reportedWasmHash: OTHER,
-    pinned: PINNED,
-    digest: digestOf(PINNED.wasmHash),
+    pinned: { wasmHash: await sha256Hex(wasm), wasmBytes: PINNED.wasmBytes },
   });
   assert.equal(report.verdict, "unrecognized");
   assert.match(report.detail, /the ledger declares/);
 });
 
 test("unreadable bytes get their own verdict and no fake statistics", async () => {
-  const report = await buildIntegrityReport({
-    wasm: new Uint8Array([1, 2, 3]),
-    pinned: PINNED,
-    digest: digestOf(OTHER),
-  });
+  const report = await buildIntegrityReport({ wasm: new Uint8Array([1, 2, 3]), pinned: PINNED });
   assert.equal(report.verdict, "malformed");
   assert.equal(report.sha256, null, "an unreadable artifact is not hashed into a verdict");
   assert.equal(report.bytes, 3);
@@ -316,14 +309,23 @@ test("the guard's own entrypoints are shown before the noise", () => {
 });
 
 test("the report defaults to this build's own artifact commitment", async () => {
-  const report = await buildIntegrityReport({
-    wasm: wasmModule([]),
-    digest: digestOf(PINNED.wasmHash),
-  });
+  const report = await buildIntegrityReport({ wasm: wasmModule([]) });
   assert.equal(report.pinnedHash, PHASE1_ARTIFACT.wasmHash);
   assert.equal(report.pinnedBytes, PHASE1_ARTIFACT.wasmBytes);
-  // The fake digest does not match the real pin, so the honest answer is "no".
+  // A well-formed module that is not the pinned artifact must not verify.
   assert.equal(report.verdict, "unrecognized");
+});
+
+test("the pin is the SDK's constant and the SDK's helper is what verifies it", async () => {
+  // The single source #252 asks for: the dashboard's pin *is* the SDK's export,
+  // so a contract release arrives here as a dependency bump, never as a local
+  // edit that can drift from what other SDK consumers pin.
+  assert.equal(PHASE1_ARTIFACT.wasmHash, GUARD_WASM_HASH);
+  const wasm = wasmModule([exportSection([exportEntry("check", 0, 1)])]);
+  const verification = await verifyGuardWasm(wasm);
+  assert.equal(verification.ok, false, "these fixtures are not the real artifact");
+  assert.equal(verification.expected, GUARD_WASM_HASH);
+  assert.match(verification.actual, /^[0-9a-f]{64}$/);
 });
 
 test("the build line says what the artifact claims about itself", () => {

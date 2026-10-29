@@ -23,7 +23,11 @@ import type { ArtifactCheck, DeployOutcome, DeployPlan } from "../lib/guard/guar
 import { deployCostBreakdown } from "../lib/guard/deployCostCalculator.ts";
 import { isWalletCancellation, type InvokeResult } from "../lib/guard/submit.ts";
 import { NETWORK, PHASE1_ARTIFACT } from "../lib/guard/network.ts";
-import { fetchContractWasm, verifyWasmIdentity } from "../lib/guard/chain.ts";
+import {
+  fetchContractWasm,
+  invalidateWasmIdentityCache,
+  verifyWasmIdentity,
+} from "../lib/guard/chain.ts";
 import { toHex } from "../lib/guard/scval.ts";
 import {
   validateInitFormFields,
@@ -1030,7 +1034,7 @@ export function DeployPanel() {
 
       {wallet && plan && deployCost && (
         <div className={deployCost.warning ? "error" : "notice info"} style={{ marginTop: 12 }}>
-          <strong>Deployment reserve check</strong>
+          <strong>Deployment reserve estimate</strong>
           <div
             className="tiny"
             style={{
@@ -1041,24 +1045,36 @@ export function DeployPanel() {
             }}
           >
             <div>
-              <div className="tiny muted">Base tx fee</div>
-              <div className="mono">{deployCost.baseFeeXlm} XLM</div>
+              <div className="tiny muted">Base tx fee (estimate)</div>
+              <div className="mono">
+                {deployCost.baseFeeXlm} XLM ({deployCost.baseFeeXlmToStroops} stroops)
+              </div>
             </div>
             <div>
-              <div className="tiny muted">WASM upload</div>
-              <div className="mono">{deployCost.wasmUploadFeeXlm} XLM</div>
+              <div className="tiny muted">WASM upload (estimate)</div>
+              <div className="mono">
+                {deployCost.wasmUploadFeeXlm} XLM ({deployCost.wasmUploadFeeXlmToStroops} stroops)
+              </div>
             </div>
             <div>
-              <div className="tiny muted">Contract instance</div>
-              <div className="mono">{deployCost.contractInstanceFeeXlm} XLM</div>
+              <div className="tiny muted">Contract instance (estimate)</div>
+              <div className="mono">
+                {deployCost.contractInstanceFeeXlm} XLM (
+                {deployCost.contractInstanceFeeXlmToStroops} stroops)
+              </div>
             </div>
             <div>
-              <div className="tiny muted">Initial rent</div>
-              <div className="mono">{deployCost.initialRentDepositXlm} XLM</div>
+              <div className="tiny muted">Initial rent (estimate)</div>
+              <div className="mono">
+                {deployCost.initialRentDepositXlm} XLM ({deployCost.initialRentDepositXlmToStroops}{" "}
+                stroops)
+              </div>
             </div>
             <div>
-              <div className="tiny muted">Required total</div>
-              <div className="mono">{deployCost.totalRequiredXlm} XLM</div>
+              <div className="tiny muted">Required total (estimate)</div>
+              <div className="mono">
+                {deployCost.totalRequiredXlm} XLM ({deployCost.totalRequiredXlmToStroops} stroops)
+              </div>
             </div>
             <div>
               <div className="tiny muted">Wallet balance</div>
@@ -1079,6 +1095,12 @@ export function DeployPanel() {
               XLM before signing.
             </div>
           )}
+          {/* Source note: fees are estimates based on network conditions and may vary at signing time */}
+          {deployCost.sourceNote && (
+            <div className="tiny" style={{ marginTop: 8, color: "var(--warn)" }}>
+              {deployCost.sourceNote}
+            </div>
+          )}
         </div>
       )}
 
@@ -1093,6 +1115,11 @@ export function DeployPanel() {
         <button
           className="secondary"
           onClick={() => {
+            // “Re-check” means ask the chain again, so the identity cached by
+            // the last read is dropped first — otherwise a mismatch could keep
+            // answering from a cache entry that read already disproved, and the
+            // only way back to a matching artifact would be a reload (issue #351).
+            invalidateWasmIdentityCache(server, PHASE1_ARTIFACT.guard);
             void fetchArtifact().then(applyArtifact);
           }}
           disabled={deploying}

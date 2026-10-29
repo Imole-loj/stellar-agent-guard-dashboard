@@ -20,8 +20,16 @@ import {
   rememberInstance,
   renameInstance,
   removeInstance,
+  removeInstances,
+  restoreInstances,
+  type GuardInstance,
   type StorageLike,
 } from "../../lib/guard/instance.ts";
+import {
+  captureRegistryBackup,
+  planBulkCleanup,
+  restoreRegistryBackup,
+} from "../../lib/guard/registry.ts";
 
 const PHASE1 = KNOWN_INSTANCES[0]!.guard;
 const PHASE2 = KNOWN_INSTANCES[1]!.guard;
@@ -265,3 +273,197 @@ function rememberForTest(
 ): ReturnType<typeof loadInstances> {
   return rememberInstance(guard, label, { network, storage });
 }
+
+// ── Issue #302: one reviewed bulk cleanup, with a one-step restore ─────────
+
+describe("bulk cleanup of stale registry entries", () => {
+  it("refuses an empty selection rather than reading it as everything", () => {
+    const plan = planBulkCleanup({
+      instances: loadInstances({ storage: memoryStorage() }),
+      selected: [],
+    });
+    assert.equal(plan.ok, false);
+    assert.equal(plan.ok === false ? plan.kind : "", "empty");
+    assert.match(plan.ok === false ? plan.error : "", /Select at least one/);
+
+    const blanks = planBulkCleanup({
+      instances: [],
+      selected: ["", "   ", ""],
+    });
+    assert.equal(blanks.ok, false);
+    assert.equal(blanks.ok === false ? blanks.kind : "", "empty");
+  });
+
+  it("offers the exact addresses and labels the confirmation must show", () => {
+    const storage = memoryStorage();
+    rememberForTest(ADDED, "Treasury", "testnet", storage);
+    rememberForTest(OTHER, "Hot wallet", "testnet", storage);
+    const plan = planBulkCleanup({
+      instances: loadInstances({ storage }),
+      selected: [ADDED, OTHER],
+    });
+    assert.equal(plan.ok, true);
+    if (!plan.ok) return;
+    assert.deepEqual(
+      plan.entries.map((entry) => [entry.guard, entry.label, entry.network]),
+      [
+        [ADDED, "Treasury", "testnet"],
+        [OTHER, "Hot wallet", "testnet"],
+      ],
+    );
+    assert.deepEqual(plan.skipped, []);
+  });
+
+  it("collapses duplicate selections so an address is confirmed once", () => {
+    const storage = memoryStorage();
+    rememberForTest(ADDED, "Treasury", "testnet", storage);
+    const plan = planBulkCleanup({
+      instances: loadInstances({ storage }),
+      selected: [ADDED, ` ${ADDED} `, ADDED],
+    });
+    assert.equal(plan.ok, true);
+    if (!plan.ok) return;
+    assert.deepEqual(
+      plan.entries.map((entry) => entry.guard),
+      [ADDED],
+    );
+  });
+
+  it("keeps build-seeded guards and names them as skipped", () => {
+    const storage = memoryStorage();
+    rememberForTest(ADDED, "Treasury", "testnet", storage);
+    const instances = loadInstances({ storage });
+
+    const mixed = planBulkCleanup({ instances, selected: [PHASE1, ADDED] });
+    assert.equal(mixed.ok, true);
+    if (!mixed.ok) return;
+    assert.deepEqual(
+      mixed.entries.map((entry) => entry.guard),
+      [ADDED],
+    );
+    assert.deepEqual(mixed.skipped, [PHASE1]);
+
+    const onlyKnown = planBulkCleanup({ instances, selected: [PHASE1, PHASE2] });
+    assert.equal(onlyKnown.ok, false);
+    assert.equal(onlyKnown.ok === false ? onlyKnown.kind : "", "unchanged");
+    assert.deepEqual(onlyKnown.ok === false ? onlyKnown.skipped : [], [PHASE1, PHASE2]);
+  });
+
+  it("removes several saved entries in one write and leaves the rest", () => {
+    const storage = memoryStorage();
+    rememberForTest(ADDED, "A", "testnet", storage);
+    rememberForTest(OTHER, "B", "testnet", storage);
+    const third = syntheticAddress(3);
+    rememberForTest(third, "C", "testnet", storage);
+
+    const result = removeInstances([ADDED, ` ${OTHER} `, ADDED], { storage });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.removed, [ADDED, OTHER], "the duplicate is removed once");
+
+    const remaining = loadInstances({ storage });
+    assert.equal(
+      remaining.some((instance) => instance.guard === ADDED || instance.guard === OTHER),
+      false,
+    );
+    assert.equal(
+      remaining.some((instance) => instance.guard === third),
+      true,
+      "an unselected entry survives",
+    );
+    assert.equal(
+      remaining.filter((instance) => isKnownInstance(instance.guard)).length,
+      KNOWN_INSTANCES.length,
+      "build-seeded guards are untouched",
+    );
+  });
+
+  it("never deletes a build-seeded guard, even when one is named", () => {
+    const storage = memoryStorage();
+    rememberForTest(ADDED, "A", "testnet", storage);
+    const result = removeInstances([PHASE1, ADDED], { storage });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.removed, [ADDED]);
+    assert.equal(
+      loadInstances({ storage }).some((instance) => instance.guard === PHASE1),
+      true,
+    );
+  });
+
+  it("reports a storage failure without leaving the list half-written", () => {
+    const backing = memoryStorage();
+    rememberForTest(ADDED, "A", "testnet", backing);
+    const failing: StorageLike = {
+      getItem: backing.getItem,
+      setItem: () => {
+        throw new Error("QuotaExceededError");
+      },
+      removeItem: (key: string) => backing.removeItem?.(key),
+    };
+
+    const result = removeInstances([ADDED], { storage: failing });
+    assert.equal(result.ok, false, "the write is reported, not thrown");
+    assert.deepEqual(result.removed, []);
+    assert.equal(
+      loadInstances({ storage: backing }).some((instance) => instance.guard === ADDED),
+      true,
+      "the stored list is exactly as it was",
+    );
+  });
+
+  it("restores the previous registry in one step, keeping entries added since", () => {
+    const storage = memoryStorage();
+    rememberForTest(ADDED, "A", "testnet", storage);
+    rememberForTest(OTHER, "B", "testnet", storage);
+    const backup = captureRegistryBackup({ storage, activeGuard: ADDED });
+
+    assert.equal(removeInstances([ADDED, OTHER], { storage }).ok, true);
+    assert.equal(
+      loadInstances({ storage }).some((instance) => !isKnownInstance(instance.guard)),
+      false,
+      "the saved list is empty after the cleanup",
+    );
+
+    const later = syntheticAddress(7);
+    rememberForTest(later, "Added after the backup", "testnet", storage);
+
+    const restored = restoreRegistryBackup(backup, { storage });
+    assert.equal(restored.ok, true);
+    assert.equal(restored.error, null);
+    const saved = loadInstances({ storage }).filter((instance) => !isKnownInstance(instance.guard));
+    assert.deepEqual(saved.map((instance) => instance.guard).sort(), [ADDED, OTHER, later].sort());
+    assert.equal(backup.activeGuard, ADDED, "the backup remembers what was on screen");
+  });
+
+  it("refuses a restore that names another network", () => {
+    const storage = memoryStorage();
+    rememberForTest(ADDED, "A", "testnet", storage);
+    const backup = captureRegistryBackup({ storage });
+
+    const result = restoreRegistryBackup(backup, { storage, network: "mainnet" });
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /another network/);
+    assert.equal(
+      loadInstances({ storage }).some((instance) => instance.guard === ADDED),
+      true,
+      "nothing was written",
+    );
+  });
+
+  it("never merges another network's entries into this bucket", () => {
+    const storage = memoryStorage();
+    const foreign: GuardInstance = {
+      guard: OTHER,
+      label: "Mainnet guard",
+      network: "mainnet",
+      addedAt: KNOWN_INSTANCE_ADDED_AT,
+      provenance: "test",
+    };
+    const result = restoreInstances([foreign], { storage });
+    assert.equal(result.ok, true);
+    assert.equal(
+      loadInstances({ storage }).some((instance) => instance.guard === OTHER),
+      false,
+      "a Testnet bucket never receives a Mainnet address",
+    );
+  });
+});

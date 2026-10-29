@@ -1,4 +1,9 @@
-import { getCachedByteLength, getCachedHash, setCachedHash } from "./bytecodeCache.ts";
+import {
+  getCachedByteLength,
+  getCachedHash,
+  invalidateCachedHash,
+  setCachedHash,
+} from "./bytecodeCache.ts";
 /**
  * Read-only access to a guard deployment, straight off Soroban RPC.
  *
@@ -400,12 +405,18 @@ export async function verifyWasmIdentity(
     const networkKey = networkCacheKey(server);
     const cachedHash = getCachedHash(networkKey, contractId);
 
-    if (cachedHash) {
+    // A cached hash that disagrees with what the ledger declares *right now* is
+    // not a hit: it describes bytes from some other read of this address — a
+    // provider that served different bytes, or a cache populated by a build
+    // pointed at another chain (the key is only testnet/public + address).
+    // Believing it would keep the panel refused on an artifact that has since
+    // been re-read correctly, with no way back short of a reload (issue #351).
+    if (cachedHash && cachedHash === reportedWasmHash) {
       return {
         reportedWasmHash,
         fetchedSha256: cachedHash,
         bytes: getCachedByteLength(networkKey, contractId) ?? 0,
-        match: reportedWasmHash === cachedHash,
+        match: true,
       };
     }
 
@@ -421,6 +432,25 @@ export async function verifyWasmIdentity(
       match: reportedWasmHash === fetchedSha256,
     };
   });
+}
+
+/**
+ * Drop the cached identity for a contract, so the next read re-fetches it.
+ *
+ * Contract code is immutable, which is what makes caching the recomputed hash
+ * and length worthwhile — until something makes the cache the thing that is
+ * wrong. The key is coarse (testnet/public + address), so a provider serving
+ * different bytes than the one that populated it, or a re-check the operator
+ * asked for on purpose, would otherwise keep answering from an entry that has
+ * already been contradicted.
+ *
+ * The deploy panel calls this before "Re-check artifact" (issue #351): pressing
+ * that button means "ask the chain again", and a cache hit would quietly turn
+ * the press into a no-op — including the case where the artifact goes back to
+ * matching the pin and the panel has to be able to say so without a reload.
+ */
+export function invalidateWasmIdentityCache(server: rpc.Server, contractId: string): void {
+  invalidateCachedHash(networkCacheKey(server), contractId);
 }
 
 /** The exact bytecode of a deployed contract, fetched from the chain. */

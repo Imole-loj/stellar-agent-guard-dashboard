@@ -49,7 +49,6 @@ import {
   importPolicyFromJson,
   exportPolicyDraft,
   exportPolicyToJson,
-  policyExportSchemaV1,
 } from "../../lib/guard/policySchema.ts";
 import {
   parseAssetCapsCsv,

@@ -26,12 +26,18 @@
 import { StrKey, type rpc } from "@stellar/stellar-sdk";
 import { readStatus } from "./chain.ts";
 import { validateLabel } from "./inputSanitizer.ts";
+import { NETWORK } from "./network.ts";
 import type { RegistryChangeNotice } from "./tabSync.ts";
 import {
   defaultGuardLabel,
+  isKnownInstance,
+  loadInstances,
+  loadSavedInstances,
   looksLikeContractAddress,
   rememberInstance,
+  restoreInstances,
   type GuardInstance,
+  type InstanceLoadOptions,
   type StorageLike,
 } from "./instance.ts";
 
@@ -162,6 +168,153 @@ export function registryAfterChange(params: {
     return [...saved, active];
   }
   return [...saved];
+}
+
+// ── Bulk cleanup of stale registry entries (issue #302) ────────────────────
+
+/** One entry a bulk cleanup is about to remove: exactly what the confirm shows. */
+export interface CleanupEntry {
+  guard: string;
+  label: string;
+  network: string;
+}
+
+export type BulkCleanupPlan =
+  | {
+      ok: false;
+      kind: "empty" | "unchanged";
+      /** Why nothing will be removed, in the operator's terms. */
+      error: string;
+      /** Addresses that were selected but cannot be deleted. */
+      skipped: string[];
+    }
+  | {
+      ok: true;
+      /** De-duplicated, registry order, ready to be shown before confirming. */
+      entries: CleanupEntry[];
+      /** Addresses selected but left alone — build-seeded entries, or unknown. */
+      skipped: string[];
+    };
+
+/**
+ * Resolve a selection into the entries a confirmation step must show.
+ *
+ * Pure and storage-free: it decides *what* may be removed so the caller can
+ * show the exact addresses and labels before anything is written. Three rules
+ * are its whole job, and each is a way a bulk delete goes wrong otherwise:
+ *
+ *   - an empty selection is refused rather than treated as "everything";
+ *   - duplicates collapse, so one address is never announced (or removed) twice;
+ *   - build-seeded instances are skipped, because those addresses are constants
+ *     of this build and deleting them would only pretend to work.
+ */
+export function planBulkCleanup(params: {
+  instances: readonly GuardInstance[];
+  selected: readonly string[];
+}): BulkCleanupPlan {
+  const targets: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of params.selected) {
+    const trimmed = candidate.trim();
+    if (trimmed === "" || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    targets.push(trimmed);
+  }
+  if (targets.length === 0) {
+    return {
+      ok: false,
+      kind: "empty",
+      error: "Select at least one registry entry to remove.",
+      skipped: [],
+    };
+  }
+
+  const entries: CleanupEntry[] = [];
+  const skipped: string[] = [];
+  const chosen = new Set<string>();
+  for (const target of targets) {
+    const instance = params.instances.find((candidate) => candidate.guard === target);
+    if (!instance || isKnownInstance(target)) {
+      skipped.push(target);
+      continue;
+    }
+    if (chosen.has(target)) continue;
+    chosen.add(target);
+    entries.push({ guard: instance.guard, label: instance.label, network: instance.network });
+  }
+
+  if (entries.length === 0) {
+    return {
+      ok: false,
+      kind: "unchanged",
+      error:
+        skipped.length > 0
+          ? "None of those can be removed: build-seeded guards are constants of this build."
+          : "None of the selected entries are in this browser's registry any more.",
+      skipped,
+    };
+  }
+  return { ok: true, entries, skipped };
+}
+
+/**
+ * The local registry as it was, captured immediately before a bulk cleanup.
+ *
+ * Only the *saved* list is captured: a build-seeded instance is not stored, so
+ * it has nothing to restore and cannot be lost. The active guard rides along so
+ * an undo can also put the operator back on the account they were viewing.
+ */
+export interface RegistryBackup {
+  network: string;
+  capturedAt: string;
+  activeGuard: string;
+  entries: GuardInstance[];
+}
+
+export function captureRegistryBackup(
+  params: { activeGuard?: string; network?: string; storage?: StorageLike | null } = {},
+): RegistryBackup {
+  const network = params.network ?? NETWORK.name;
+  const storage = params.storage;
+  return {
+    network,
+    capturedAt: new Date().toISOString(),
+    activeGuard: params.activeGuard ?? "",
+    entries: loadSavedInstances({
+      network,
+      ...(storage === undefined ? {} : { storage }),
+    }),
+  };
+}
+
+/**
+ * Merge a captured registry back into the stored one (issue #302).
+ *
+ * A backup taken for another network is refused rather than applied: the saved
+ * list is namespaced per network, and cross-writing it would put a Testnet
+ * address into the Mainnet selector.
+ */
+export function restoreRegistryBackup(
+  backup: RegistryBackup,
+  options: InstanceLoadOptions = {},
+): { ok: boolean; error: string | null; instances: GuardInstance[] } {
+  const network = options.network ?? backup.network;
+  if (backup.network !== network) {
+    return {
+      ok: false,
+      error: "That restore point belongs to another network.",
+      instances: loadInstances(options),
+    };
+  }
+  const restored = restoreInstances(backup.entries, { ...options, network });
+  if (!restored.ok) {
+    return {
+      ok: false,
+      error: "The previous registry could not be written back — nothing was restored.",
+      instances: restored.instances,
+    };
+  }
+  return { ok: true, error: null, instances: restored.instances };
 }
 
 /**

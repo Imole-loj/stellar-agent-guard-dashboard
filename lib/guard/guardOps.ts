@@ -8,8 +8,7 @@
  */
 
 import { Account, Address, Operation, TransactionBuilder, rpc, xdr } from "@stellar/stellar-sdk";
-import { sha256Hex } from "./scval.ts";
-import type { GuardStatus, PolicyConfig } from "stellar-agent-guard-sdk";
+import { verifyGuardWasm, type GuardStatus, type PolicyConfig } from "stellar-agent-guard-sdk";
 import { NETWORK, PHASE1_ARTIFACT } from "./network.ts";
 import { buildPolicyConfig, type PolicyDraft } from "./policyForm.ts";
 import {
@@ -31,8 +30,7 @@ import {
   describeRejectedResult,
   diagnosticEventsOf,
   invokeWithWallet,
-  isWalletCancellation,
-  actionableCancellationMessage,
+  writeBoundary,
   type InvokeResult,
   type WalletSigner,
 } from "./submit.ts";
@@ -177,6 +175,14 @@ export async function submitOperation(params: {
     };
   }
 
+  // A deploy or an upload is reviewed on the panel before this runs, and the
+  // wallet can move to another account while that panel is open. The boundary
+  // is re-read here exactly as it is for a contract call, so a deployment can
+  // never be signed — or broadcast — by an account other than the one that was
+  // on screen (issue #349).
+  const beforeEnvelope = await writeBoundary(signer, "envelope");
+  if (beforeEnvelope) return beforeEnvelope;
+
   announce("Please approve transaction in Freighter");
   let signedXdr: string;
   try {
@@ -196,6 +202,9 @@ export async function submitOperation(params: {
   // The envelope's fee field carries inclusion fee + resource fee — exactly
   // what the network will charge for this transaction.
   const feeStroops = transaction.fee;
+
+  const beforeSend = await writeBoundary(signer, "submission");
+  if (beforeSend) return beforeSend;
 
   const sent = await server.sendTransaction(transaction);
   if (sent.status === "ERROR") {
@@ -445,10 +454,10 @@ export async function deployGuard(params: {
   if (!present.ok) throw new GuardOperationError(`could not read the code entry: ${present.error}`);
   if (!present.value) {
     const wasm = await fetchContractWasm(server, PHASE1_ARTIFACT.guard);
-    const fetchedHash = await sha256Hex(wasm);
-    if (fetchedHash !== PHASE1_ARTIFACT.wasmHash) {
+    const verification = await verifyGuardWasm(wasm, PHASE1_ARTIFACT.wasmHash);
+    if (!verification.ok) {
       throw new GuardOperationError(
-        `refusing to upload: fetched bytes hash to ${fetchedHash}, not the pinned ${PHASE1_ARTIFACT.wasmHash}`,
+        `refusing to upload: fetched bytes hash to ${verification.actual}, not the pinned ${verification.expected}`,
       );
     }
     const upload = await submitOperation({

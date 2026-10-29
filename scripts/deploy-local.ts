@@ -50,7 +50,8 @@ import {
 } from "../lib/guard/chain.ts";
 import { artifactCodePresent, initializeGuard, submitOperation } from "../lib/guard/guardOps.ts";
 import { PHASE1_ARTIFACT, TESTNET, TESTNET_ARTIFACT_SOURCE } from "../lib/guard/network.ts";
-import { hexToBytes, sha256Hex } from "../lib/guard/scval.ts";
+import { hexToBytes } from "../lib/guard/scval.ts";
+import { verifyGuardWasm } from "stellar-agent-guard-sdk";
 import type { InvokeResult, WalletSigner } from "../lib/guard/submit.ts";
 
 /** The local standalone network's defaults, as `stellar/quickstart` serves them. */
@@ -357,11 +358,11 @@ async function main(): Promise<void> {
   // ── 1. the pin, re-derived from where Phase 1 proved it ─────────────────
   step("[1/6] pinned artifact, fetched from public testnet and verified");
   const wasm = await fetchContractWasm(artifactServer, options.artifactSource);
-  const fetchedHash = await sha256Hex(wasm);
+  const verification = await verifyGuardWasm(wasm, PHASE1_ARTIFACT.wasmHash);
   step(`    source       ${options.artifactSource} (${options.artifactRpcUrl})`);
-  step(`    fetched      ${fetchedHash} (${wasm.length} bytes)`);
-  step(`    pinned       ${PHASE1_ARTIFACT.wasmHash} (${PHASE1_ARTIFACT.wasmBytes} bytes)`);
-  if (fetchedHash !== PHASE1_ARTIFACT.wasmHash || wasm.length !== PHASE1_ARTIFACT.wasmBytes) {
+  step(`    fetched      ${verification.actual} (${wasm.length} bytes)`);
+  step(`    pinned       ${verification.expected} (${PHASE1_ARTIFACT.wasmBytes} bytes)`);
+  if (!verification.ok || wasm.length !== PHASE1_ARTIFACT.wasmBytes) {
     throw new Error(
       "the bytes at the artifact source are not the pinned artifact — refusing to deploy anything locally",
     );

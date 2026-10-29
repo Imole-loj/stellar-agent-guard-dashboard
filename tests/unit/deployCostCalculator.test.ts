@@ -38,7 +38,14 @@ test("deploy cost covers the protocol fee and rent minimum for an upload-and-cre
     balanceAfterRequired: "8.1398376",
     safetyBufferXlm: "2",
     warning: false,
-  } satisfies DeployCostBreakdown);
+    baseFeeXlmToStroops: 100000n,
+    wasmUploadFeeXlmToStroops: 6000000n,
+    contractInstanceFeeXlmToStroops: 2500000n,
+    initialRentDepositXlmToStroops: 10001624n,
+    totalRequiredXlmToStroops: 18601624n,
+    sourceNote:
+      "Fees are estimates based on current network conditions and may vary at signing time.",
+  });
 });
 
 test("a deploy with a low balance warns before the minimum reserve is reached", () => {

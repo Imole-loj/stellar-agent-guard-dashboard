@@ -322,6 +322,17 @@ function loadSaved(options?: InstanceLoadOptions): {
 }
 
 /**
+ * The operator-saved entries only (no known instances), for callers that need
+ * what is *stored* rather than what the selector shows — a backup of the
+ * registry taken before a bulk cleanup, for instance. A build-seeded instance
+ * the operator renamed is present as a saved shadow, which is exactly what is
+ * on disk and exactly what a restore has to put back.
+ */
+export function loadSavedInstances(options?: InstanceLoadOptions): GuardInstance[] {
+  return loadSaved(options).saved;
+}
+
+/**
  * Remember an instance the operator added so it survives a reload.
  *
  * Returns the combined list (known + saved) that resulted, so the caller can set
@@ -399,6 +410,109 @@ export function removeInstance(guard: string, options?: InstanceLoadOptions): Gu
     saved.filter((instance) => instance.guard !== trimmed),
   );
   return loadInstances({ network, storage });
+}
+
+/** What one bulk write did, or failed to do, to the saved list. */
+export interface BulkRemovalResult {
+  /** False when the stored list could not be written; nothing changed then. */
+  ok: boolean;
+  /** The saved addresses the write actually removed. */
+  removed: string[];
+  /** The combined list (known + saved) after the attempt. */
+  instances: GuardInstance[];
+}
+
+/**
+ * Remove several operator-saved instances in one write (issue #302).
+ *
+ * One write rather than a loop of single removals: a bulk cleanup must land
+ * whole or not at all, so the stored list is never left half-edited by a
+ * failure partway through. Addresses are trimmed, de-duplicated, and a
+ * build-seeded address is never a candidate — those are constants, not state,
+ * so a selection that contains them is narrowed rather than obeyed.
+ *
+ * A storage failure is reported as `ok: false` with the list untouched; it
+ * never throws, because a full disk is a reason to tell the operator, not a
+ * reason to lose the exception.
+ */
+export function removeInstances(
+  guards: readonly string[],
+  options?: InstanceLoadOptions,
+): BulkRemovalResult {
+  const { network, storage, saved } = loadSaved(options);
+  const targets = new Set<string>();
+  for (const candidate of guards) {
+    const trimmed = candidate.trim();
+    if (trimmed === "" || isKnownInstance(trimmed)) continue;
+    targets.add(trimmed);
+  }
+  const removed = saved
+    .filter((instance) => targets.has(instance.guard))
+    .map((instance) => instance.guard);
+  // Nothing selected is saved: report success without touching storage, so an
+  // empty or already-applied selection cannot be mistaken for a failed write.
+  if (removed.length === 0) {
+    return { ok: true, removed: [], instances: loadInstances({ network, storage }) };
+  }
+  const remaining = saved.filter((instance) => !targets.has(instance.guard));
+  let ok = false;
+  try {
+    ok = writeNamespaced(network, storage, remaining);
+  } catch {
+    ok = false;
+  }
+  if (!ok) {
+    return { ok: false, removed: [], instances: loadInstances({ network, storage }) };
+  }
+  return { ok: true, removed, instances: loadInstances({ network, storage }) };
+}
+
+/** What one restore did, or failed to do, to the saved list. */
+export interface RegistryRestoreResult {
+  /** False when the stored list could not be written; nothing changed then. */
+  ok: boolean;
+  /** How many captured entries were merged back in. */
+  restored: number;
+  /** The combined list (known + saved) after the attempt. */
+  instances: GuardInstance[];
+}
+
+/**
+ * Put a previously captured saved list back (issue #302).
+ *
+ * This is the one-step undo behind a bulk cleanup, so it *merges* the captured
+ * entries into what is stored now rather than replacing it: everything the
+ * cleanup removed comes back, and anything added since the backup was taken
+ * survives the restore. Entries for another network, malformed addresses and
+ * duplicates are dropped, and the list is capped like any other write.
+ *
+ * As with removal, a storage failure is reported rather than thrown.
+ */
+export function restoreInstances(
+  entries: readonly GuardInstance[],
+  options?: InstanceLoadOptions,
+): RegistryRestoreResult {
+  const { network, storage, saved } = loadSaved(options);
+  const merged: GuardInstance[] = [];
+  const seen = new Set<string>();
+  for (const instance of [...entries, ...saved]) {
+    if (instance.network !== network) continue;
+    if (!looksLikeContractAddress(instance.guard)) continue;
+    if (seen.has(instance.guard)) continue;
+    seen.add(instance.guard);
+    merged.push({ ...instance, network });
+  }
+  let ok = false;
+  try {
+    ok = writeNamespaced(network, storage, merged.slice(0, INSTANCE_LIMIT));
+  } catch {
+    ok = false;
+  }
+  if (!ok) {
+    return { ok: false, restored: 0, instances: loadInstances({ network, storage }) };
+  }
+  const restored = merged.length - saved.length;
+  return { ok: true, restored, instances: loadInstances({ network, storage }) };
 }
 
 /** True when the address is one of the build-seeded instances and cannot be deleted. */

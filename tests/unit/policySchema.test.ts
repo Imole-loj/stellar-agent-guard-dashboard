@@ -10,6 +10,7 @@ import {
 } from "../../lib/guard/policySchema.ts";
 import { EMPTY_DRAFT, type PolicyDraft } from "../../lib/guard/policyForm.ts";
 import type { AssetCapOverride } from "../../lib/guard/assetCapsCsv.ts";
+import { NETWORK } from "../../lib/guard/network.ts";
 
 const ASSET = "CDCYDGBGS5AZ5BZS6XY2SK2PHJHSOEGTN3N4INCK34KF6GU2BGC7Z6MB";
 const RECIPIENT = "GAOBCRXTCO4ZCBNHALJUMJJ5JDXNOUZ7U6VZJX4UBTXAHQEO66IPU6PH";
@@ -66,6 +67,7 @@ test("policyToExport / importPolicyFromJson round-trips a full config", () => {
 test("exported JSON carries the versioned schema and issue-specified field names", () => {
   const parsed = policyToExport(fullConfig, assetCaps);
   assert.equal(parsed.version, POLICY_SCHEMA_VERSION);
+  assert.equal(parsed.network, NETWORK.name);
   assert.equal(parsed.max_amount_per_tx, "1000");
   assert.equal(parsed.window_cap, "5000");
   assert.equal(parsed.window_seconds, "86400");
@@ -137,7 +139,7 @@ test("importPolicyFromJson rejects malformed JSON", () => {
 });
 
 test("importPolicyFromJson rejects an unknown schema version with a precise path", () => {
-  const json = exportPolicyToJson(fullConfig, assetCaps).replace('"version": 1', '"version": 2');
+  const json = exportPolicyToJson(fullConfig, assetCaps).replace('"version": 2', '"version": 3');
   const result = importPolicyFromJson(json);
   assert.equal(result.ok, false);
   if (result.ok) return;
@@ -272,4 +274,46 @@ test("importPolicyFromJson accepts a valid large positive whole number", () => {
   assert.equal(result.ok, true);
   if (!result.ok) return;
   assert.equal(result.draft.perTxCap, "999999999999");
+});
+
+test("importPolicyFromJson rejects a file for a different network", () => {
+  const result = importPolicyFromJson(
+    exportPolicyToJson(fullConfig, assetCaps, "mainnet"),
+    "testnet",
+  );
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  const networkIssue = result.issues.find((issue) => issue.path === "network");
+  assert.ok(networkIssue, 'expected a validation issue at path "network"');
+  assert.match(networkIssue!.message, /targets "mainnet".*configured for "testnet"/);
+});
+
+test("importPolicyFromJson requires contract IDs for asset and protocol identifiers", () => {
+  const parsedAsset = JSON.parse(exportPolicyToJson(fullConfig, assetCaps));
+  parsedAsset.assets = [RECIPIENT];
+  const assetResult = importPolicyFromJson(JSON.stringify(parsedAsset));
+  assert.equal(assetResult.ok, false);
+  if (assetResult.ok) return;
+  assert.ok(
+    assetResult.issues.some(
+      (issue) => issue.path === "assets[0]" && /contract address/.test(issue.message),
+    ),
+  );
+
+  const parsedProtocol = JSON.parse(exportPolicyToJson(fullConfig, assetCaps));
+  parsedProtocol.allowed_protocols = [{ contract: RECIPIENT, functions: ["swap"] }];
+  const protocolResult = importPolicyFromJson(JSON.stringify(parsedProtocol));
+  assert.equal(protocolResult.ok, false);
+  if (protocolResult.ok) return;
+  assert.ok(protocolResult.issues.some((issue) => issue.path === "allowed_protocols[0].contract"));
+});
+
+test("importPolicyFromJson rejects a legacy version without network identity", () => {
+  const parsed = JSON.parse(exportPolicyToJson(fullConfig, assetCaps));
+  parsed.version = 1;
+  delete parsed.network;
+  const result = importPolicyFromJson(JSON.stringify(parsed));
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.ok(result.issues.some((issue) => issue.path === "version"));
 });
