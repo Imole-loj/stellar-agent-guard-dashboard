@@ -25,9 +25,11 @@ import {
 } from "./chain.ts";
 import {
   INCLUSION_FEE,
+  actionableCancellationMessage,
   assembleFromSimulation,
   buildInitialEnvelope,
   describeRejectedResult,
+  isWalletCancellation,
   diagnosticEventsOf,
   invokeWithWallet,
   writeBoundary,
