@@ -479,6 +479,15 @@ export function compileDeploymentReceipt(input: DeploymentReceiptInput): Deploym
         "The create transaction was exported unsigned; nothing was broadcast.",
       ),
     );
+  } else if (createStep.result.kind === "cancelled") {
+    checks.push(
+      check(
+        "contract-created",
+        "Create transaction",
+        "unavailable",
+        "The create signature was declined in the wallet; nothing was broadcast.",
+      ),
+    );
   } else {
     checks.push(
       check(
