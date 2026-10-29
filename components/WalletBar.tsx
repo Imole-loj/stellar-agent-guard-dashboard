@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useGuard } from "./GuardProvider.tsx";
 import { AddressText, ErrorBlock, short, useAddressLabel } from "./bits.tsx";
 import { AddressBookModal } from "./AddressBookModal.tsx";
@@ -32,6 +32,12 @@ import {
   recoveryGuidance,
   subscribeWriteInterruption,
 } from "../lib/guard/writeReview.ts";
+import { NETWORK, RPC_HEALTH_CAVEAT, describeRpcHealth } from "../lib/guard/network.ts";
+import {
+  probeRpcHealth,
+  sanitizeEndpointOrigin,
+  type RpcHealthResult,
+} from "../lib/rpc/timeouts.ts";
 
 export function WalletBar() {
   const {
@@ -73,6 +79,34 @@ export function WalletBar() {
   );
   const interruptionGuidance =
     interruptionState === null ? null : recoveryGuidance(interruptionState.interruption);
+
+  // ── Endpoint health (issue #346) ────────────────────────────────────────
+  // One read-only probe when the bar mounts, then only when the operator asks
+  // for another: a health panel that polls on a timer becomes part of the load
+  // it is measuring, and it would keep talking to a provider that is already
+  // struggling. Nothing in this request carries wallet or account material.
+  const [health, setHealth] = useState<RpcHealthResult | null>(null);
+  const [probing, setProbing] = useState(false);
+  const [healthDismissed, setHealthDismissed] = useState(false);
+  const probedOnce = useRef(false);
+
+  const probeEndpoint = useCallback(async () => {
+    setProbing(true);
+    try {
+      setHealth(await probeRpcHealth(NETWORK.rpcUrl));
+    } finally {
+      setProbing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    // React's development double-invoke must not turn "once" into "twice".
+    if (probedOnce.current) return;
+    probedOnce.current = true;
+    void probeEndpoint();
+  }, [probeEndpoint]);
+
+  const healthCopy = health === null ? null : describeRpcHealth(health);
 
   const selected = instances.find((instance) => instance.guard === guard);
   const guardNickname = useAddressLabel(guard);
@@ -287,6 +321,45 @@ export function WalletBar() {
         </div>
       </div>
 
+      {!healthDismissed && (
+        <div
+          className="notice info"
+          role="status"
+          data-testid="rpc-health"
+          style={{ marginTop: 12 }}
+        >
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <strong>RPC endpoint health</strong>
+            <button
+              type="button"
+              className="secondary"
+              style={{ padding: "4px 8px", fontSize: "0.8em" }}
+              onClick={() => setHealthDismissed(true)}
+              aria-label="Dismiss RPC endpoint health"
+            >
+              Dismiss
+            </button>
+          </div>
+          <span className="tiny mono">{sanitizeEndpointOrigin(NETWORK.rpcUrl)}</span>
+          <span className="tiny">
+            {probing ? "Checking…" : healthCopy === null ? "Not checked" : healthCopy.label}
+          </span>
+          {healthCopy !== null && <span className="tiny">{healthCopy.headline}</span>}
+          {health !== null && !health.ok && <span className="tiny mono">{health.detail}</span>}
+          <span className="tiny muted">{RPC_HEALTH_CAVEAT}</span>
+          <div className="row" style={{ marginTop: 6 }}>
+            <button
+              type="button"
+              className="secondary"
+              style={{ padding: "4px 8px", fontSize: "0.8em" }}
+              disabled={probing}
+              onClick={() => void probeEndpoint()}
+            >
+              {probing ? "Checking…" : "Check again"}
+            </button>
+          </div>
+        </div>
+      )}
       {bookOpen && <AddressBookModal onClose={() => setBookOpen(false)} />}
       {renameTarget && (
         <RenameGuardModal

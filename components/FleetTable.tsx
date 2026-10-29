@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { formatStroopsWithUnit } from "../lib/guard/formatters.ts";
 import { POLLING, jitteredInterval } from "../lib/guard/polling.ts";
@@ -30,16 +30,49 @@ import {
 import { Skeleton, starLink } from "./bits.tsx";
 import { useRouter } from "next/navigation";
 import { freighterSigner } from "../lib/guard/wallet.ts";
+import {
+  captureRegistryBackup,
+  planBulkCleanup,
+  type BulkCleanupPlan,
+  type CleanupEntry,
+  type RegistryBackup,
+} from "../lib/guard/registry.ts";
 
 // One store for the tab: the remembered view (search, filters, sort), never row data.
 const fleetViewStore = createFleetViewStore({ networks: [NETWORK.name] });
 
+/**
+ * What the confirmation says about the boundary of a cleanup: this browser's
+ * list is cleared, the contracts on chain are not, and the change can be put
+ * back in one step. Kept here rather than inline so the paragraph is one string
+ * the formatter treats as a unit.
+ */
+const CLEANUP_COPY =
+  "Every address and label below will be cleared from this browser's registry. No contract on chain is deleted or changed, and the previous list can be restored in one step.";
+
+/** The same explanation, counted: how many selected entries were left alone. */
+function skippedCopy(count: number): string {
+  const noun = count === 1 ? "entry was" : "entries were";
+  return `${count} selected ${noun} kept: a build-seeded guard is a constant of this build and cannot be deleted.`;
+}
+
 export function FleetTable() {
-  const { wallet, server } = useGuard();
+  const { wallet, server, instances, guard, removeInstances, restoreRegistry } = useGuard();
   const router = useRouter();
 
   const [rows, setRows] = useState<FleetRow[]>([]);
   const [loading, setLoading] = useState(true);
+  // Bumped after a registry write so the table re-reads immediately instead of
+  // waiting out the poll interval with rows it already knows are stale.
+  const [refreshKey, setRefreshKey] = useState(0);
+  // The operator's selection, as addresses. Kept as a list rather than a Set so
+  // the order a row was ticked in survives, which is what the confirm shows.
+  const [selected, setSelected] = useState<readonly string[]>([]);
+  const [cleanupPlan, setCleanupPlan] = useState<Extract<BulkCleanupPlan, { ok: true }> | null>(
+    null,
+  );
+  const [cleanupError, setCleanupError] = useState<string | null>(null);
+  const [undo, setUndo] = useState<{ backup: RegistryBackup; count: number } | null>(null);
 
   // The operator's view of the table (search, filters, sort). It is remembered
   // across visits but is not registry data: only these choices are stored, never
@@ -75,7 +108,7 @@ export function FleetTable() {
       mounted = false;
       clearInterval(interval);
     };
-  }, [server]);
+  }, [server, refreshKey]);
 
   // Derived from the rows as last read, so a poll that changes a guard's status
   // immediately moves it in or out of the filtered, sorted view.
@@ -93,6 +126,66 @@ export function FleetTable() {
   const resetView = () => fleetViewStore.set(DEFAULT_FLEET_VIEW);
   const viewIsDefault = isDefaultFleetView(view);
   const filtering = hasActiveFleetFilter(view);
+
+  const visibleAddresses = filteredAndSorted.map((row) => row.contact.address);
+  const allVisibleSelected =
+    visibleAddresses.length > 0 && visibleAddresses.every((address) => selected.includes(address));
+
+  const toggleSelected = (address: string) => {
+    setCleanupError(null);
+    setSelected((current) =>
+      current.includes(address)
+        ? current.filter((entry) => entry !== address)
+        : [...current, address],
+    );
+  };
+
+  const toggleAllVisible = () => {
+    setCleanupError(null);
+    setSelected((current) =>
+      allVisibleSelected
+        ? current.filter((address) => !visibleAddresses.includes(address))
+        : [...new Set([...current, ...visibleAddresses])],
+    );
+  };
+
+  /**
+   * Ask for confirmation before anything is written.
+   *
+   * The plan is the whole point: an empty selection, a duplicated address and a
+   * build-seeded guard each resolve here rather than at the storage layer, so the
+   * dialog that follows can only ever offer entries that would really be removed.
+   */
+  const openCleanup = () => {
+    const plan = planBulkCleanup({ instances, selected });
+    if (!plan.ok) {
+      setCleanupPlan(null);
+      setCleanupError(plan.error);
+      return;
+    }
+    setCleanupError(null);
+    setCleanupPlan(plan);
+  };
+
+  const confirmCleanup = () => {
+    if (!cleanupPlan) return;
+    // Captured first: the backup has to describe the registry as it is *now*,
+    // not as the write will leave it.
+    const backup = captureRegistryBackup({ activeGuard: guard });
+    const count = cleanupPlan.entries.length;
+    const removed = removeInstances(cleanupPlan.entries.map((entry) => entry.guard));
+    setCleanupPlan(null);
+    setSelected([]);
+    if (removed) setUndo({ backup, count });
+    setRefreshKey((key) => key + 1);
+  };
+
+  const undoCleanup = () => {
+    if (!undo) return;
+    restoreRegistry(undo.backup);
+    setUndo(null);
+    setRefreshKey((key) => key + 1);
+  };
 
   const handleFreeze = async (guard: string) => {
     if (!wallet) {
@@ -239,12 +332,71 @@ export function FleetTable() {
             Showing {filteredAndSorted.length} of {rows.length} guard{rows.length !== 1 ? "s" : ""}
           </span>
         )}
+        {tableState.kind === "rows" && (
+          <span className="tiny muted" role="status">
+            {selected.length} of {filteredAndSorted.length} selected
+          </span>
+        )}
+        {selected.length > 0 && (
+          <button
+            type="button"
+            className="danger"
+            style={{ padding: "4px 8px", fontSize: "0.8em" }}
+            onClick={openCleanup}
+          >
+            Remove selected ({selected.length})
+          </button>
+        )}
       </div>
+
+      {cleanupError && (
+        <div className="notice warn" role="alert" style={{ marginTop: 8 }}>
+          <strong>Nothing was removed</strong>
+          <span className="tiny">{cleanupError}</span>
+        </div>
+      )}
+
+      {undo && (
+        <div className="notice info" role="status" data-testid="registry-cleanup-undo">
+          <strong>
+            Removed {undo.count} saved guard{undo.count !== 1 ? "s" : ""} from this browser
+          </strong>
+          <span className="tiny">
+            Nothing on chain was touched — this only cleared this browser&apos;s list.
+          </span>
+          <div className="row" style={{ marginTop: 6 }}>
+            <button
+              type="button"
+              className="secondary"
+              style={{ padding: "4px 8px", fontSize: "0.8em" }}
+              onClick={undoCleanup}
+            >
+              Restore previous registry
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              style={{ padding: "4px 8px", fontSize: "0.8em" }}
+              onClick={() => setUndo(null)}
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="scrolly table-stack" style={{ marginTop: 14 }}>
         <table className="events stack">
           <thead>
             <tr>
+              <th scope="col">
+                <input
+                  type="checkbox"
+                  checked={allVisibleSelected}
+                  onChange={toggleAllVisible}
+                  aria-label="Select all guards shown"
+                />
+              </th>
               <th scope="col">Guard</th>
               <th scope="col">Network</th>
               <th scope="col">Status</th>
@@ -278,12 +430,15 @@ export function FleetTable() {
                   <td>
                     <Skeleton lines={1} />
                   </td>
+                  <td>
+                    <Skeleton lines={1} />
+                  </td>
                 </tr>
               ))}
             {tableState.kind === "registry-empty" && (
               <tr>
                 <td
-                  colSpan={6}
+                  colSpan={7}
                   className="fleet-empty"
                   style={{ textAlign: "center", padding: "28px 20px" }}
                 >
@@ -298,7 +453,7 @@ export function FleetTable() {
             {tableState.kind === "filter-empty" && (
               <tr>
                 <td
-                  colSpan={6}
+                  colSpan={7}
                   className="fleet-empty"
                   style={{ textAlign: "center", padding: "28px 20px" }}
                 >
@@ -315,6 +470,14 @@ export function FleetTable() {
             {tableState.kind === "rows" &&
               filteredAndSorted.map((row) => (
                 <tr key={row.contact.address}>
+                  <td data-label="Select">
+                    <input
+                      type="checkbox"
+                      checked={selected.includes(row.contact.address)}
+                      onChange={() => toggleSelected(row.contact.address)}
+                      aria-label={`Select ${row.contact.label}`}
+                    />
+                  </td>
                   <td data-label="Guard">
                     <div>
                       <strong>{row.contact.label}</strong>
@@ -361,6 +524,100 @@ export function FleetTable() {
               ))}
           </tbody>
         </table>
+      </div>
+
+      {cleanupPlan && (
+        <BulkCleanupModal
+          plan={cleanupPlan}
+          onClose={() => setCleanupPlan(null)}
+          onConfirm={confirmCleanup}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Confirm a bulk removal, showing exactly what it will remove (issue #302).
+ *
+ * A deletion is never a single click in this console (issue #22), and a bulk one
+ * has to be reviewed address by address before it is applied: the list here is
+ * the plan itself, so what the operator reads is what is written. The copy also
+ * states the boundary that matters — the browser's saved list is cleared, the
+ * contracts on chain are not touched — and the caller keeps a one-step restore
+ * of the registry as it was.
+ */
+export function BulkCleanupModal({
+  plan,
+  onClose,
+  onConfirm,
+}: {
+  plan: Extract<BulkCleanupPlan, { ok: true }>;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    dialogRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => document.removeEventListener("keydown", onKeyDown, true);
+  }, [onClose]);
+
+  const count = plan.entries.length;
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="bulk-cleanup-title"
+        ref={dialogRef}
+        tabIndex={-1}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <strong id="bulk-cleanup-title">
+          Remove {count} saved guard{count !== 1 ? "s" : ""} from this browser?
+        </strong>
+        <p className="tiny muted">{CLEANUP_COPY}</p>
+        <div className="scrolly" style={{ maxHeight: 220, marginTop: 8 }}>
+          <table className="events">
+            <thead>
+              <tr>
+                <th scope="col">Label</th>
+                <th scope="col">Address</th>
+                <th scope="col">Network</th>
+              </tr>
+            </thead>
+            <tbody>
+              {plan.entries.map((entry: CleanupEntry) => (
+                <tr key={entry.guard}>
+                  <td data-label="Label">{entry.label}</td>
+                  <td className="mono tiny" data-label="Address">
+                    {entry.guard}
+                  </td>
+                  <td className="tiny" data-label="Network">
+                    {entry.network}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {plan.skipped.length > 0 && (
+          <p className="tiny muted">{skippedCopy(plan.skipped.length)}</p>
+        )}
+        <div className="row" style={{ marginTop: 12 }}>
+          <button className="danger" onClick={onConfirm}>
+            Remove {count} guard{count !== 1 ? "s" : ""}
+          </button>
+          <button className="secondary" onClick={onClose}>
+            Cancel
+          </button>
+        </div>
       </div>
     </div>
   );

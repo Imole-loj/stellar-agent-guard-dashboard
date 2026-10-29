@@ -17,7 +17,11 @@ import type { ArtifactCheck, DeployOutcome, DeployPlan } from "../lib/guard/guar
 import { deployCostBreakdown } from "../lib/guard/deployCostCalculator.ts";
 import type { InvokeResult } from "../lib/guard/submit.ts";
 import { NETWORK, PHASE1_ARTIFACT } from "../lib/guard/network.ts";
-import { fetchContractWasm, verifyWasmIdentity } from "../lib/guard/chain.ts";
+import {
+  fetchContractWasm,
+  invalidateWasmIdentityCache,
+  verifyWasmIdentity,
+} from "../lib/guard/chain.ts";
 import { toHex } from "../lib/guard/scval.ts";
 import {
   validateInitFormFields,
@@ -965,6 +969,11 @@ export function DeployPanel() {
         <button
           className="secondary"
           onClick={() => {
+            // “Re-check” means ask the chain again, so the identity cached by
+            // the last read is dropped first — otherwise a mismatch could keep
+            // answering from a cache entry that read already disproved, and the
+            // only way back to a matching artifact would be a reload (issue #351).
+            invalidateWasmIdentityCache(server, PHASE1_ARTIFACT.guard);
             void fetchArtifact().then(applyArtifact);
           }}
           disabled={deploying}

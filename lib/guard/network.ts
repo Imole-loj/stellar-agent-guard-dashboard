@@ -12,6 +12,8 @@ import { GUARD_WASM_HASH } from "stellar-agent-guard-sdk";
  * instance to read the pinned bytes from — and those default to public testnet.
  */
 
+import type { RpcHealthFailure, RpcHealthResult } from "../rpc/timeouts.ts";
+
 /**
  * The canonical public Stellar testnet: the defaults, and the network the pinned
  * artifact is published on.
@@ -106,4 +108,53 @@ export const SALT_BYTES = 32;
 export async function getHealthyRpcEndpoints(urls: string[]) {
   // Health racing logic
   return urls;
+}
+
+// ── Endpoint health panel copy (issue #346) ─────────────────────────────
+
+/**
+ * The sentence the health panel repeats beside every state.
+ *
+ * It exists to stop a reachability read being read as a guard read: "the
+ * provider answered" and "the contract is healthy" are different claims, and
+ * only the second one is any use in an incident — which is exactly when this
+ * panel is looked at.
+ */
+export const RPC_HEALTH_CAVEAT =
+  "Endpoint reachability only: this says nothing about a guard's on-chain state.";
+
+export interface RpcHealthCopy {
+  /** Which pill treatment the panel uses for this state. */
+  tone: "ok" | "warn";
+  /** The short line beside the endpoint origin. */
+  label: string;
+  /** One sentence explaining the state in the operator's terms. */
+  headline: string;
+}
+
+/**
+ * The one wording for an endpoint probe, so the panel cannot describe the same
+ * result two ways. Latency is reported for a success and for a timeout alike,
+ * because "it took 4s to say nothing" is the fact an operator needs when they
+ * are deciding whether to retry or switch endpoints.
+ */
+export function describeRpcHealth(result: RpcHealthResult): RpcHealthCopy {
+  if (result.ok) {
+    return {
+      tone: "ok",
+      label: `reachable · ${result.latencyMs} ms`,
+      headline: `The endpoint answered “${result.status}”.`,
+    };
+  }
+  const headline: Record<RpcHealthFailure, string> = {
+    timeout: "The endpoint did not answer in time.",
+    malformed: "The endpoint answered, but not in the shape this console reads.",
+    unavailable: "The endpoint answered with an error status.",
+    network: "The endpoint could not be reached from this browser.",
+  };
+  return {
+    tone: "warn",
+    label: `unreachable · ${result.latencyMs} ms`,
+    headline: headline[result.failure],
+  };
 }

@@ -476,8 +476,16 @@ function interruptedResult(interruption: WriteInterruption): InvokeResult {
 /**
  * Re-check the wallet binding at a write boundary, returning a result instead
  * of throwing when the wallet moved. `null` means the write may continue.
+ *
+ * Exported because the deploy path (`guardOps.submitOperation`) signs through
+ * the same wallet as a contract call and therefore owes the console the same
+ * guarantee: no signature and no broadcast for an account the review was not
+ * built for (issue #349).
  */
-async function boundary(signer: WalletSigner, phase: WritePhase): Promise<InvokeResult | null> {
+export async function writeBoundary(
+  signer: WalletSigner,
+  phase: WritePhase,
+): Promise<InvokeResult | null> {
   try {
     await revalidateWallet({
       boundAddress: signer.address,
@@ -608,7 +616,7 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
     // re-derive, including the credential kind and the entry's expiration ledger.
     // Before asking for it, the live account is re-read: a wallet that switched
     // administrators since the simulation must not sign this review (issue #340).
-    const beforeAuth = await boundary(signer, "authorization");
+    const beforeAuth = await writeBoundary(signer, "authorization");
     if (beforeAuth) return beforeAuth;
     promptWallet();
     let signedEntryXdr: string;
@@ -696,7 +704,7 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
   // signatures and the envelope signature: the envelope is what commits the
   // source account, so signing it for a different administrator is precisely
   // the silent source switch this check exists to prevent.
-  const beforeEnvelope = await boundary(signer, "envelope");
+  const beforeEnvelope = await writeBoundary(signer, "envelope");
   if (beforeEnvelope) return beforeEnvelope;
   promptWallet();
   let signedEnvelope: string;
@@ -725,7 +733,7 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
   // Broadcast is the last boundary: a provider that vanished here may have
   // been the only witness to a submission, so the outcome is reported as
   // "verify before retrying" rather than as a failure (issue #341).
-  const beforeSend = await boundary(signer, "submission");
+  const beforeSend = await writeBoundary(signer, "submission");
   if (beforeSend) return beforeSend;
 
   let sent: rpc.Api.SendTransactionResponse;

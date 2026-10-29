@@ -7,7 +7,7 @@ name: visual-tests
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, pr/442]
   workflow_dispatch:
 
 permissions:
@@ -64,3 +64,48 @@ jobs:
           name: visual-diffs
           path: test-results/
           retention-days: 14
+
+  # One-off maintenance job: regenerate the committed baselines inside the exact
+  # container image the comparison runs in, then push them back to the branch.
+  # Gated on the commit message so ordinary pushes never enter it (the run would
+  # otherwise loop on its own baseline commit, whose message does not match).
+  update-screenshots:
+    name: update screenshots (CI)
+    if: github.event_name == 'push' && contains(github.event.head_commit.message, 'update-screenshots')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: write
+
+    container:
+      image: mcr.microsoft.com/playwright:v1.64.0-noble
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # The suite starts the production server itself (webServer in the config),
+      # inside the same image whose fonts the baselines are generated against.
+      - name: Regenerate baselines
+        run: npx playwright test --config=playwright.visual.config.ts --update-snapshots
+
+      - name: Push refreshed baselines
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if git diff --quiet -- 'tests/visual/__screenshots__'; then
+            echo "Baselines already match; nothing to push."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add 'tests/visual/__screenshots__'
+          git commit -m "Refresh visual baselines in the CI container image"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${GITHUB_REF_NAME}"

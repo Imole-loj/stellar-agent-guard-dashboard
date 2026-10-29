@@ -83,7 +83,29 @@ export interface MockChainOptions {
    * instead of relying on this.
    */
   eventBatchSize?: number;
+  /**
+   * What this chain says the Phase 1 artifact is (issue #351). Defaults to the
+   * genuine fixture, so every other spec is unaffected.
+   */
+  artifact?: ArtifactMode;
 }
+
+/**
+ * The artifact a mock chain serves, as the deploy gate reads it: the bytes of
+ * the code entry *and* the hash the instance declares for them.
+ *
+ * Both are derived from the same bytes on purpose. A mismatched artifact
+ * therefore declares its own hash, which keeps the mock internally consistent —
+ * the failure the panel reports is a mismatch against the pin, not a torn read
+ * where the ledger and the code entry disagree with each other.
+ */
+export type ArtifactMode =
+  /** The genuine fixture: hash and byte length both match the pin. */
+  | "pinned"
+  /** The right length, bytes that hash to something that is not the pin. */
+  | "hash-mismatch"
+  /** More bytes than the pin allows — a length mismatch of its own. */
+  | "length-mismatch";
 
 function readJsonFixture<T>(relativePath: string): T {
   return JSON.parse(readFileSync(join(process.cwd(), relativePath), "utf8")) as T;
@@ -138,6 +160,21 @@ function decodeCall(transactionXdr: string): ContractCall | null {
   return null;
 }
 
+/** The same module with one byte flipped: right length, wrong hash. */
+function withFlippedByte(bytes: Uint8Array): Uint8Array {
+  const copy = bytes.slice();
+  const last = copy.length - 1;
+  copy[last] = (copy[last] ?? 0) ^ 0xff;
+  return copy;
+}
+
+/** The same module with a tail: wrong length, and a different hash too. */
+function withExtraBytes(bytes: Uint8Array, extra: number): Uint8Array {
+  const copy = new Uint8Array(bytes.length + extra);
+  copy.set(bytes);
+  return copy;
+}
+
 export class SorobanRpcMock {
   /** Every JSON-RPC method the page has asked for, in order (debug aid). */
   readonly requests: string[] = [];
@@ -145,10 +182,18 @@ export class SorobanRpcMock {
   deliveredEvents = 0;
   /** Contracts created/frozen/… during the test, keyed by address. */
   readonly guards = new Map<string, GuardState>();
+  /**
+   * Which artifact this chain serves. Public so a spec can flip it mid-test —
+   * mismatched, then valid again — without reloading the page, which is exactly
+   * the recovery the deploy panel has to demonstrate (issue #351).
+   */
+  artifactMode: ArtifactMode;
+
   private readonly contractInstances = new Set<string>([PHASE1_ARTIFACT.guard]);
 
   private readonly capture: RpcCapture;
   private readonly wasm: Uint8Array;
+  private readonly artifacts = new Map<ArtifactMode, { bytes: Uint8Array; hash: string }>();
   private readonly encodedEvents: EncodedEvent[];
   private readonly eventBatchSize: number | null;
   private readonly transactions = new Map<string, string>();
@@ -162,6 +207,7 @@ export class SorobanRpcMock {
     this.capture = readJsonFixture<RpcCapture>("tests/fixtures/rpc-capture.json");
     this.latestLedger = this.capture.sequence;
     this.eventBatchSize = options.eventBatchSize ?? null;
+    this.artifactMode = options.artifact ?? "pinned";
 
     this.wasm = new Uint8Array(
       readFileSync(join(process.cwd(), "tests/fixtures/phase1-artifact.wasm")),
@@ -172,6 +218,7 @@ export class SorobanRpcMock {
         `tests/fixtures/phase1-artifact.wasm does not match the pinned artifact (${digest}, ${this.wasm.length} bytes)`,
       );
     }
+    this.artifacts.set("pinned", { bytes: this.wasm, hash: digest });
 
     this.encodedEvents = (options.events ?? []).map((spec) => ({
       ledger: spec.ledger,
@@ -196,6 +243,25 @@ export class SorobanRpcMock {
         sorobanMeta: null,
       }),
     ).toXDR("base64");
+  }
+
+  /**
+   * The bytes this chain serves as the Phase 1 artifact, with the hash the
+   * ledger declares for them (issue #351).
+   *
+   * Derived once per mode and reused, so a spec that flips the mode back gets
+   * byte-identical answers rather than a new random mismatch.
+   */
+  private activeArtifact(): { bytes: Uint8Array; hash: string } {
+    const known = this.artifacts.get(this.artifactMode);
+    if (known) return known;
+    const bytes =
+      this.artifactMode === "length-mismatch"
+        ? withExtraBytes(this.wasm, 8)
+        : withFlippedByte(this.wasm);
+    const derived = { bytes, hash: createHash("sha256").update(bytes).digest("hex") };
+    this.artifacts.set(this.artifactMode, derived);
+    return derived;
   }
 
   /** How many `getEvents` pages the mock has served so far. */
@@ -319,12 +385,13 @@ export class SorobanRpcMock {
     }
 
     if (key.type === "contractCode") {
+      const active = this.activeArtifact();
       const requested = hashToHex(key.contractCode.hash);
-      if (requested !== PHASE1_ARTIFACT.wasmHash) return null;
+      if (requested !== active.hash) return null;
       const entry = new xdr.ContractCodeEntry({
         ext: xdr.ContractCodeEntryExt.v0(),
-        hash: new Uint8Array(Buffer.from(PHASE1_ARTIFACT.wasmHash, "hex")),
-        code: this.wasm,
+        hash: new Uint8Array(Buffer.from(active.hash, "hex")),
+        code: active.bytes,
       });
       return {
         key: keyB64,
@@ -352,7 +419,7 @@ export class SorobanRpcMock {
         val: xdr.ScVal.scvContractInstance(
           new xdr.ScContractInstance({
             executable: xdr.ContractExecutable.contractExecutableWasm(
-              new Uint8Array(Buffer.from(PHASE1_ARTIFACT.wasmHash, "hex")),
+              new Uint8Array(Buffer.from(this.activeArtifact().hash, "hex")),
             ),
             storage: [],
           }),
