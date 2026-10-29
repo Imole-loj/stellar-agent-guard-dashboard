@@ -49,6 +49,7 @@ import {
   importPolicyFromJson,
   exportPolicyDraft,
   exportPolicyToJson,
+  POLICY_SCHEMA_VERSION,
 } from "../../lib/guard/policySchema.ts";
 import {
   parseAssetCapsCsv,
@@ -462,9 +463,11 @@ test("exportPolicyDraft never throws for arbitrary draft input", () => {
         assert.equal(typeof result.json, "string");
         assert.ok(result.json.trim().startsWith("{"));
         assert.ok(result.json.trim().endsWith("}"));
-        // Verify it's valid JSON
+        // Verify it's valid JSON, stamped with the schema this build writes —
+        // a literal here would silently go stale the next time the schema is
+        // bumped, and only when fast-check happens to land on a valid draft.
         const parsed = JSON.parse(result.json);
-        assert.equal(parsed.version, 1);
+        assert.equal(parsed.version, POLICY_SCHEMA_VERSION);
       } else {
         assert.ok(result.issues.length > 0);
       }
