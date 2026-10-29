@@ -713,6 +713,7 @@ describe("a declined signature is its own outcome (#291)", () => {
     const prompts: string[] = [];
     const result = await invokeWithWallet({
       ...WRITE_REQUEST,
+      cancelOnDecline: true,
       server: makeWalletBoundaryServer(sendCalls),
       signer: decliningSigner(prompts),
     });
@@ -729,11 +730,32 @@ describe("a declined signature is its own outcome (#291)", () => {
     const signer = decliningSigner(prompts);
     const server = makeWalletBoundaryServer(sendCalls, [makeAddressAuthEntry(signer.address)]);
 
-    const result = await invokeWithWallet({ ...WRITE_REQUEST, server, signer });
+    const result = await invokeWithWallet({
+      ...WRITE_REQUEST,
+      cancelOnDecline: true,
+      server,
+      signer,
+    });
 
     assert.equal(result.kind, "cancelled");
     assert.deepEqual(prompts, ["auth-entry"], "the envelope is never prompted after a decline");
     assert.deepEqual(sendCalls, []);
+  });
+
+  it("keeps every other write on its old path: a decline is still thrown", async () => {
+    // Policy install, freeze and key rotation never opt in, so their callers —
+    // and the tests that pin their wording — see exactly what they saw before
+    // #291: the wallet's own error, not a new outcome kind.
+    const prompts: string[] = [];
+    const signer = decliningSigner(prompts);
+    const server = makeWalletBoundaryServer([], [makeAddressAuthEntry(signer.address)]);
+
+    await assert.rejects(
+      invokeWithWallet({ ...WRITE_REQUEST, server, signer }),
+      /declined/i,
+      "without cancelOnDecline the decline keeps its original thrown form",
+    );
+    assert.deepEqual(prompts, ["auth-entry"], "the decline still happens at the same boundary");
   });
 
   it("keeps a simulation failure distinguishable: that is a refusal, not a decline", async () => {
@@ -819,7 +841,12 @@ describe("a declined signature is its own outcome (#291)", () => {
       },
     };
 
-    const declined = await invokeWithWallet({ ...WRITE_REQUEST, server, signer });
+    const declined = await invokeWithWallet({
+      ...WRITE_REQUEST,
+      cancelOnDecline: true,
+      server,
+      signer,
+    });
     assert.equal(declined.kind, "cancelled");
     assert.deepEqual(state.sends, [], "the declined attempt broadcasts nothing");
     assert.equal(state.reads, 1, "one account read per attempt");
@@ -827,7 +854,12 @@ describe("a declined signature is its own outcome (#291)", () => {
 
     // The retry only happens because the operator asked for it — this call is the
     // button press, and nothing in the write path re-ran on its own.
-    const retried = await invokeWithWallet({ ...WRITE_REQUEST, server, signer });
+    const retried = await invokeWithWallet({
+      ...WRITE_REQUEST,
+      cancelOnDecline: true,
+      server,
+      signer,
+    });
     assert.equal(retried.kind, "submitted");
     assert.ok(
       state.sims > simsAfterDecline,

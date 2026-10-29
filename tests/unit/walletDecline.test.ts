@@ -12,8 +12,15 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { Account, Keypair, Operation, rpc } from "@stellar/stellar-sdk";
-import { classifyDeploySteps, submitOperation, type DeployStep } from "../../lib/guard/guardOps.ts";
+import { Account, Keypair, Operation, SorobanDataBuilder, rpc, xdr } from "@stellar/stellar-sdk";
+import {
+  classifyDeploySteps,
+  initializeGuard,
+  installPolicy,
+  submitOperation,
+  type DeployStep,
+} from "../../lib/guard/guardOps.ts";
+import { EMPTY_DRAFT, type PolicyDraft } from "../../lib/guard/policyForm.ts";
 import { deployOutcomeView, initOutcomeView } from "../../components/DeployPanel.tsx";
 import { WalletUserRejectedError } from "../../lib/guard/walletConnector.ts";
 import type { InvokeResult, WalletSigner } from "../../lib/guard/submit.ts";
@@ -263,5 +270,99 @@ describe("submitOperation after a decline (#291)", () => {
       "only a decline is classified; other errors keep their old path",
     );
     assert.deepEqual(sent, []);
+  });
+});
+
+/**
+ * The scope boundary of #291: only the deploy/initialize path turns a decline
+ * into an outcome. Every other write shares `invokeWithWallet`, so if it opted
+ * in too, a policy install the operator cancelled would stop reading like the
+ * failure its tests (and its operators) pin down. These two calls go through the
+ * same code path with the same declining wallet and must still disagree.
+ */
+describe("only deploy/initialize end a decline as an outcome (#291)", () => {
+  const GUARD = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+  const AGENT_KEY = "ab".repeat(32);
+
+  function decliningSigner(): WalletSigner {
+    const keypair = Keypair.random();
+    return {
+      address: keypair.publicKey(),
+      currentAddress: async () => keypair.publicKey(),
+      async signTransaction(): Promise<string> {
+        throw new WalletUserRejectedError("freighter", "sign this transaction");
+      },
+      async signAuthEntry(): Promise<string> {
+        throw new Error("this call has no authorization entries");
+      },
+    };
+  }
+
+  /** A chain that answers every read, so the write reaches the wallet prompt. */
+  function chain(sent: string[]): rpc.Server {
+    return {
+      getAccount: async (address: string) => new Account(address, "1"),
+      simulateTransaction: async () => ({
+        transactionData: new SorobanDataBuilder()
+          .setReadWrite([])
+          .setResourceFee(BigInt(500))
+          .setResources(1_000_000, 0, 0)
+          .build(),
+        minResourceFee: "500",
+        result: { auth: [], retval: xdr.ScVal.scvVoid() },
+        events: [],
+        latestLedger: 200,
+        cost: { cpuInsns: "0", memBytes: "0" },
+        stateChanges: [],
+      }),
+      sendTransaction: async () => {
+        sent.push("sent");
+        return { status: "PENDING", hash: "ab".repeat(32), latestLedger: 200 };
+      },
+      getTransaction: async () => {
+        assert.fail("a declined write is never broadcast, so there is nothing to poll");
+      },
+    } as unknown as rpc.Server;
+  }
+
+  it("initialize ends as cancelled, because that is the panel's retryable write", async () => {
+    const sent: string[] = [];
+    const result = await initializeGuard({
+      server: chain(sent),
+      signer: decliningSigner(),
+      guard: GUARD,
+      agentPubkeyHex: AGENT_KEY,
+      passphrase: PASSPHRASE,
+    });
+
+    assert.equal(result.kind, "cancelled");
+    assert.match(result.detail, /declined/i);
+    assert.deepEqual(sent, [], "nothing was broadcast");
+  });
+
+  it("a declined policy install still throws at its caller, unchanged", async () => {
+    const sent: string[] = [];
+    const draft: PolicyDraft = {
+      ...EMPTY_DRAFT,
+      perTxCap: "1000",
+      windowCap: "150",
+      windowSecs: "60",
+      assets: "CDCYDGBGS5AZ5BZS6XY2SK2PHJHSOEGTN3N4INCK34KF6GU2BGC7Z6MB",
+      recipients: "GAOBCRXTCO4ZCBNHALJUMJJ5JDXNOUZ7U6VZJX4UBTXAHQEO66IPU6PH",
+    };
+
+    await assert.rejects(
+      () =>
+        installPolicy({
+          server: chain(sent),
+          signer: decliningSigner(),
+          guard: GUARD,
+          draft,
+          passphrase: PASSPHRASE,
+        }),
+      /declined/i,
+      "the policy path keeps the thrown decline it has always had",
+    );
+    assert.deepEqual(sent, [], "nothing was broadcast");
   });
 });

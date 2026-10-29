@@ -544,6 +544,9 @@ export async function initializeGuard(params: {
     fn: "initialize",
     args: [addressToScVal(params.signer.address), xdr.ScVal.scvBytes(pubkey)],
     signer: params.signer,
+    // Initialize is the write this panel offers a retry for, so its decline is
+    // an outcome the operator can act on rather than a thrown error (issue #291).
+    cancelOnDecline: true,
     ...(params.passphrase !== undefined ? { passphrase: params.passphrase } : {}),
   });
 }

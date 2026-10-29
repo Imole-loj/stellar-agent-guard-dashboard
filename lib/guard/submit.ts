@@ -136,6 +136,18 @@ export interface InvokeRequest {
   passphrase?: string;
   exportOnly?: boolean;
   /**
+   * End the write as its own `cancelled` outcome when the operator declines the
+   * signature, instead of throwing the decline back at the caller (issue #291).
+   *
+   * Deliberately opt-in rather than the default: a decline only becomes a
+   * first-class outcome on the deploy/initialize path this issue covers, where
+   * the panel words it separately from a failure and offers an explicit retry.
+   * Every other write — policy install/revoke, freeze/unfreeze, key rotation —
+   * keeps throwing exactly as it did before, so their existing visible outcome
+   * (and the tests that pin it) is untouched.
+   */
+  cancelOnDecline?: boolean;
+  /**
    * A smart account whose own storage must be merged into the footprint. Only
    * needed when the call is authorized *by* the guard (its `__check_auth` reads
    * policy/window/freeze state); an admin call passes `null`, because there the
@@ -640,11 +652,12 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
         announce("Wallet interrupted during authorization signing — nothing was resubmitted");
         return interruptedResult(interruption.interruption);
       }
-      // A decline is the operator's decision, not a failure: it gets its own
-      // outcome so the panel can say "nothing was broadcast" and offer an
-      // explicit retry, instead of reporting a broadcast that never happened
-      // (issue #291).
-      if (isWalletCancellation(error)) return cancelledResult(error);
+      // A decline is the operator's decision, not a failure: when the caller
+      // asked for it (deploy/initialize, issue #291) it gets its own outcome so
+      // the panel can say "nothing was broadcast" and offer an explicit retry,
+      // instead of reporting a broadcast that never happened. Otherwise the
+      // decline is thrown exactly as it was before.
+      if (request.cancelOnDecline && isWalletCancellation(error)) return cancelledResult(error);
       throw error;
     }
     signed.push(xdr.SorobanAuthorizationEntry.fromXDR(signedEntryXdr, "base64"));
@@ -735,10 +748,11 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
       announce("Wallet interrupted during transaction signing — nothing was resubmitted");
       return interruptedResult(interruption.interruption);
     }
-    // Same at the envelope as at the authorization entry: the operator said no,
-    // so the write ends as a cancellation and never reaches the network
-    // (issue #291). Nothing is retried from here — the retry is theirs to ask for.
-    if (isWalletCancellation(error)) return cancelledResult(error);
+    // Same at the envelope as at the authorization entry: where the caller asked
+    // for it, the operator saying no ends the write as a cancellation that never
+    // reaches the network (issue #291). Nothing is retried from here — the retry
+    // is theirs to ask for.
+    if (request.cancelOnDecline && isWalletCancellation(error)) return cancelledResult(error);
     throw error;
   }
 
