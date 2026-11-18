@@ -21,6 +21,7 @@ import {
   xdr,
 } from "@stellar/stellar-sdk";
 import {
+  invalidateWasmIdentityCache,
   isInitialized,
   readContract,
   readNativeXlmBalance,
@@ -29,6 +30,7 @@ import {
   readWindow,
   verifyWasmIdentity,
 } from "../../lib/guard/chain.ts";
+import { setCachedHash } from "../../lib/guard/bytecodeCache.ts";
 import { GuardFeed, refusedEventsFromDiagnostics } from "../../lib/guard/telemetry.ts";
 import { RPC_HEALTH_CAVEAT, describeRpcHealth } from "../../lib/guard/network.ts";
 import { probeRpcHealth, type RpcHealthResult } from "../../lib/rpc/timeouts.ts";
@@ -198,6 +200,77 @@ describe("ledger reads", () => {
 
   test("verifyWasmIdentity rejects when the contract does not exist", async () => {
     await assert.rejects(verifyWasmIdentity(server, MOCK_GUARD));
+  });
+});
+
+describe("verifyWasmIdentity provenance (issue #290)", () => {
+  const WASM = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x2a]);
+  const OTHER_WASM = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x2b]);
+
+  /** Install a contract code entry and an instance whose executable points at it. */
+  function installInstance(bytes: Uint8Array) {
+    const code = contractCodeEntry(bytes);
+    mock.setLedgerEntry(code);
+    mock.setLedgerEntry(contractInstanceEntry({ contractId: MOCK_GUARD, wasmHash: code.hash }));
+    return code;
+  }
+
+  test("a network read is labelled as one and carries the time it was read", async () => {
+    installInstance(WASM);
+    invalidateWasmIdentityCache(server, MOCK_GUARD);
+
+    const identity = await verifyWasmIdentity(server, MOCK_GUARD);
+
+    assert.equal(identity.source, "network");
+    assert.equal(identity.bytes, WASM.length);
+    assert.ok(
+      !Number.isNaN(Date.parse(identity.verifiedAt)),
+      "a network read states when it read the bytes",
+    );
+  });
+
+  test("a verification the ledger still confirms is a cache hit with its original time", async () => {
+    installInstance(WASM);
+    invalidateWasmIdentityCache(server, MOCK_GUARD);
+
+    const first = await verifyWasmIdentity(server, MOCK_GUARD);
+    const second = await verifyWasmIdentity(server, MOCK_GUARD);
+
+    assert.equal(first.source, "network");
+    assert.equal(second.source, "cache");
+    assert.equal(
+      second.verifiedAt,
+      first.verifiedAt,
+      "a hit reports the read it reuses, not the moment it was hit",
+    );
+    assert.equal(second.fetchedSha256, first.fetchedSha256);
+    assert.equal(second.bytes, first.bytes);
+    assert.equal(second.match, true);
+  });
+
+  test("a cache whose bytes the ledger no longer declares is re-read, never trusted", async () => {
+    // The first read caches bytes for hash A; the instance then reports hash B
+    // (a provider that served different bytes, or a re-deploy in another tab).
+    installInstance(WASM);
+    invalidateWasmIdentityCache(server, MOCK_GUARD);
+    await verifyWasmIdentity(server, MOCK_GUARD);
+
+    const other = installInstance(OTHER_WASM);
+    const identity = await verifyWasmIdentity(server, MOCK_GUARD);
+
+    assert.equal(identity.source, "network", "the live instance hash is authoritative");
+    assert.equal(identity.fetchedSha256, toHex(other.hash));
+    assert.equal(identity.bytes, OTHER_WASM.length);
+  });
+
+  test("a cache entry with no byte length is re-read: the pin checks length too", async () => {
+    const code = installInstance(WASM);
+    setCachedHash("public", MOCK_GUARD, toHex(code.hash), 0);
+
+    const identity = await verifyWasmIdentity(server, MOCK_GUARD);
+
+    assert.equal(identity.source, "network");
+    assert.equal(identity.bytes, WASM.length);
   });
 });
 

@@ -223,6 +223,8 @@ function matchingIdentity(overrides: Partial<WasmIdentity> = {}): WasmIdentity {
     fetchedSha256: PINNED_HASH,
     bytes: PINNED_BYTES,
     match: true,
+    source: "network",
+    verifiedAt: CAPTURED_AT,
     ...overrides,
   };
 }

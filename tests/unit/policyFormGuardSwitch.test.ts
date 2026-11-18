@@ -72,7 +72,14 @@ function snapshotFor(guard: string, perTxCap: bigint): GuardSnapshot {
     window: { ok: true, value: null },
     identity: {
       ok: true,
-      value: { reportedWasmHash: "abc123", fetchedSha256: "abc123", bytes: 39673, match: true },
+      value: {
+        reportedWasmHash: "abc123",
+        fetchedSha256: "abc123",
+        bytes: 39673,
+        match: true,
+        source: "network",
+        verifiedAt: "2026-09-25T10:00:00.000Z",
+      },
     },
   };
 }

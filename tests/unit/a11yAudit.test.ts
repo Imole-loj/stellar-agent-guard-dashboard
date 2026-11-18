@@ -227,7 +227,14 @@ test("StatusPanel passes axe-core with the default-deny banner showing", async (
     window: { ok: true, value: null },
     identity: {
       ok: true,
-      value: { reportedWasmHash: null, fetchedSha256: "abc123", bytes: 39673, match: false },
+      value: {
+        reportedWasmHash: null,
+        fetchedSha256: "abc123",
+        bytes: 39673,
+        match: false,
+        source: "network",
+        verifiedAt: "2026-09-25T10:00:00.000Z",
+      },
     },
   };
   const context = { ...TEST_GUARD, snapshot: noPolicy };

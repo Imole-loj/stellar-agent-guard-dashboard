@@ -1,9 +1,4 @@
-import {
-  getCachedByteLength,
-  getCachedHash,
-  invalidateCachedHash,
-  setCachedHash,
-} from "./bytecodeCache.ts";
+import { getCachedVerification, invalidateCachedHash, setCachedHash } from "./bytecodeCache.ts";
 /**
  * Read-only access to a guard deployment, straight off Soroban RPC.
  *
@@ -370,6 +365,22 @@ export interface WasmIdentity {
   bytes: number;
   /** True when the ledger's declared hash and the fetched bytes agree. */
   match: boolean;
+  /**
+   * Where `fetchedSha256`/`bytes` came from (issue #290):
+   *
+   * - `network` — the WASM was downloaded and hashed by this call;
+   * - `cache`  — the bytes were read and hashed earlier (same network and
+   *   address) and this call re-confirmed the ledger's instance hash still
+   *   equals the cached one, so the stored bytes are reused instead of
+   *   re-downloading them. The ledger read itself is always live; only the
+   *   (immutable) bytecode fetch is skipped.
+   *
+   * A cache hit is never presented as a fresh read: the panel labels it
+   * `cache hit` and shows `verifiedAt` — the time of the read being reused.
+   */
+  source: "cache" | "network";
+  /** ISO timestamp of the read that produced these bytes (`cache` or `network`). */
+  verifiedAt: string;
 }
 
 /**
@@ -403,7 +414,6 @@ export async function verifyWasmIdentity(
     // Contract code is immutable, so an unchanged instance lets us skip the
     // (large) WASM download and the SHA-256 over it.
     const networkKey = networkCacheKey(server);
-    const cachedHash = getCachedHash(networkKey, contractId);
 
     // A cached hash that disagrees with what the ledger declares *right now* is
     // not a hit: it describes bytes from some other read of this address — a
@@ -411,12 +421,20 @@ export async function verifyWasmIdentity(
     // pointed at another chain (the key is only testnet/public + address).
     // Believing it would keep the panel refused on an artifact that has since
     // been re-read correctly, with no way back short of a reload (issue #351).
-    if (cachedHash && cachedHash === reportedWasmHash) {
+    // The same applies to an entry with no byte length: the deploy gate checks
+    // the pin's length as well as its hash, and a hit that cannot state a
+    // length could only ever fail that check (issue #290).
+    const cached = getCachedVerification(networkKey, contractId);
+    if (cached && cached.hash === reportedWasmHash && cached.byteLength > 0) {
       return {
         reportedWasmHash,
-        fetchedSha256: cachedHash,
-        bytes: getCachedByteLength(networkKey, contractId) ?? 0,
+        fetchedSha256: cached.hash,
+        bytes: cached.byteLength,
         match: true,
+        // The ledger's declared hash was read live just now; the bytes it was
+        // compared against were fetched and hashed at `verifiedAt`.
+        source: "cache",
+        verifiedAt: new Date(cached.verifiedAt).toISOString(),
       };
     }
 
@@ -430,6 +448,8 @@ export async function verifyWasmIdentity(
       fetchedSha256,
       bytes: bytes.length,
       match: reportedWasmHash === fetchedSha256,
+      source: "network",
+      verifiedAt: new Date().toISOString(),
     };
   });
 }

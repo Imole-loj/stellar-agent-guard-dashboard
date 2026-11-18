@@ -71,7 +71,7 @@ test.describe("deploy is refused when the artifact pin does not match", () => {
     // Same length as the pin, different bytes: only the hash half can catch
     // this one, and the panel must say which artifact it actually fetched.
     const fetched = page.locator(".stat", { hasText: "Fetched from chain" });
-    await expect(fetched.locator(".n")).toHaveText(`${PHASE1_ARTIFACT.wasmBytes} bytes`);
+    await expect(fetched.locator(".n")).toHaveText(`${PHASE1_ARTIFACT.wasmBytes} bytes, SHA-256`);
     await expect(fetched.locator(".v")).not.toHaveText(`${PINNED_PREFIX}...`);
 
     await expectRefusedBeforeSigning(page);
@@ -83,9 +83,44 @@ test.describe("deploy is refused when the artifact pin does not match", () => {
     // Longer than the pinned module, so the size half fails even if a hash
     // comparison were ever skipped.
     const fetched = page.locator(".stat", { hasText: "Fetched from chain" });
-    await expect(fetched.locator(".n")).toHaveText(`${MISMATCHED_LENGTH} bytes`);
+    await expect(fetched.locator(".n")).toHaveText(`${MISMATCHED_LENGTH} bytes, SHA-256`);
 
     await expectRefusedBeforeSigning(page);
+  });
+
+  test("verification states its byte source and read time, and a re-check forces a fresh read", async ({
+    page,
+  }) => {
+    await openDeploy(page, "pinned");
+
+    const verification = page.locator(".stat", { hasText: "Verification" });
+    // A fresh document starts with no stored verification (the console wipes
+    // session storage when a page goes away), so the first read is always a
+    // network fetch and is labelled as one.
+    await expect(verification.locator(".v")).toHaveText("network read");
+    await expect(verification.locator(".n")).toHaveText(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC/);
+
+    const source = page.locator(".stat", { hasText: "Source instance" });
+    const shortGuard = `${PHASE1_ARTIFACT.guard.slice(0, 6)}…${PHASE1_ARTIFACT.guard.slice(-4)}`;
+    await expect(source.locator(".v")).toHaveText(shortGuard);
+    await expect(source.locator(".v")).toHaveAttribute("title", PHASE1_ARTIFACT.guard);
+    await expect(page.getByRole("button", { name: "Deploy guard" })).toBeEnabled();
+
+    // A reload is a new document, and the console wipes session storage when a
+    // page goes away — so cached bytes never outlive it, and the panel reads the
+    // chain again rather than presenting a stale verification as fresh.
+    await page.reload();
+    await expect(page.locator(".pill.ok").filter({ hasText: "connected" })).toBeVisible();
+    await expect(verification.locator(".v")).toHaveText("network read");
+    await expect(page.getByRole("button", { name: "Deploy guard" })).toBeEnabled();
+
+    // The explicit refresh drops any cached verification and reads the chain
+    // again; deploy stays enabled only because the fresh read still passes the
+    // pin and length checks.
+    await page.getByRole("button", { name: "Re-check artifact" }).click();
+    await expect(verification.locator(".v")).toHaveText("network read");
+    await expect(page.getByRole("button", { name: "Deploy guard" })).toBeEnabled();
+    expect(await signRequestCount(page)).toBe(0);
   });
 
   test("a valid artifact afterwards re-enables deploy without a reload", async ({ page }) => {

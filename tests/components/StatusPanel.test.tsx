@@ -94,6 +94,8 @@ describe("StatusPanel", () => {
         reportedWasmHash: "abc123",
         fetchedSha256: "def456",
         bytes: 12345,
+        source: "network",
+        verifiedAt: "2026-09-25T10:00:00.000Z",
       },
     },
   };
@@ -141,6 +143,8 @@ describe("StatusPanel", () => {
         reportedWasmHash: "abc123",
         fetchedSha256: "def456",
         bytes: 12345,
+        source: "network",
+        verifiedAt: "2026-09-25T10:00:00.000Z",
       },
     },
   };
@@ -188,6 +192,8 @@ describe("StatusPanel", () => {
         reportedWasmHash: "abc123",
         fetchedSha256: "def456",
         bytes: 12345,
+        source: "network",
+        verifiedAt: "2026-09-25T10:00:00.000Z",
       },
     },
   };
@@ -223,6 +229,8 @@ describe("StatusPanel", () => {
         reportedWasmHash: "abc123",
         fetchedSha256: "def456",
         bytes: 12345,
+        source: "network",
+        verifiedAt: "2026-09-25T10:00:00.000Z",
       },
     },
   };

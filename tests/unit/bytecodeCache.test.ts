@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, mock, test } from "node:test";
 import {
+  BYTECODE_CACHE_STORAGE_KEY,
   getCachedByteLength,
   getCachedHash,
+  getCachedVerification,
   invalidateCachedHash,
   setCachedHash,
 } from "../../lib/guard/bytecodeCache.ts";
@@ -89,6 +91,40 @@ test("keeps at most 50 entries, evicting the least-recently used", () => {
   assert.equal(getCachedHash(NETWORK, contract(5)), null);
   assert.equal(getCachedHash(NETWORK, contract(6)), "6");
   assert.equal(getCachedHash(NETWORK, contract(54)), "54");
+});
+
+test("a cached verification reports the time the bytes were read, not the time it was hit", () => {
+  // Provenance (issue #290): a hit is evidence about an *earlier* read, so the
+  // timestamp it carries must be that read's, not `Date.now()` at hit time.
+  setCachedHash(NETWORK, contract(0), HASH, 4096, 1_700_000_000_000);
+
+  assert.deepEqual(getCachedVerification(NETWORK, contract(0)), {
+    hash: HASH,
+    byteLength: 4096,
+    verifiedAt: 1_700_000_000_000,
+  });
+  assert.equal(getCachedVerification(NETWORK, contract(1)), null);
+});
+
+test("an entry written without a verification time is a miss and is dropped", () => {
+  // Entries from a build that predates the provenance field cannot be trusted
+  // to say when the bytes were read, so they are not reported as hits: the next
+  // read re-fetches the bytes (issue #290).
+  backing.set(
+    BYTECODE_CACHE_STORAGE_KEY,
+    JSON.stringify({
+      [`${NETWORK}:${contract(0)}`]: {
+        hash: HASH,
+        byteLength: 4096,
+        expiresAt: Date.now() + 60_000,
+      },
+    }),
+  );
+
+  assert.equal(getCachedVerification(NETWORK, contract(0)), null);
+  assert.equal(getCachedHash(NETWORK, contract(0)), null);
+  assert.equal(getCachedByteLength(NETWORK, contract(0)), null);
+  assert.deepEqual(JSON.parse(backing.get(BYTECODE_CACHE_STORAGE_KEY) ?? "{}"), {});
 });
 
 test("invalidateCachedHash removes a single entry without touching its neighbours", () => {

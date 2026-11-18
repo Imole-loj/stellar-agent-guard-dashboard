@@ -83,8 +83,9 @@ import {
 } from "../lib/guard/printReport.ts";
 import { announce } from "../lib/guard/useAnnounce.ts";
 import { usePwaActivity } from "../lib/guard/usePwaActivity.ts";
+import { artifactGate, artifactProvenance } from "../lib/guard/artifactProvenance.ts";
 import { MigrationWizard } from "./MigrationWizard.tsx";
-import { ErrorBlock, OutcomeList, starLink } from "./bits.tsx";
+import { ErrorBlock, OutcomeList, short, starLink } from "./bits.tsx";
 
 /** Either the chain's answer about the artifact, or why there is not one. */
 type ArtifactFetch = { artifact: ArtifactCheck } | { error: string };
@@ -227,6 +228,10 @@ export function DeployPanel() {
   const { server, signer, wallet, refresh, addInstance, guard } = useGuard();
   const [artifact, setArtifact] = useState<ArtifactCheck | null>(null);
   const [artifactError, setArtifactError] = useState<string | null>(null);
+  // A refresh in flight: the deploy control stays inert until the new chain
+  // answer is in, so the verification being replaced cannot authorize a
+  // signature (issue #290).
+  const [refreshingArtifact, setRefreshingArtifact] = useState(false);
   const [salt, setSalt] = useState<Uint8Array>(() => randomSalt());
   // The plan is stored together with the inputs it was computed for, so a plan
   // that no longer matches the wallet or salt is simply not shown. Deriving
@@ -352,6 +357,25 @@ export function DeployPanel() {
     }
   }, []);
 
+  /**
+   * The explicit refresh: ask the chain again, from the network.
+   *
+   * "Re-check" means the operator wants a read they did not have before, so the
+   * cached verification is dropped first — otherwise the press could be served
+   * by the very entry it is meant to re-derive (issue #351) and the panel could
+   * only ever report `cache hit` (issue #290). Deploy is disabled for the whole
+   * read, so no signature can rest on the verification being replaced.
+   */
+  const refreshArtifact = useCallback(async () => {
+    setRefreshingArtifact(true);
+    try {
+      invalidateWasmIdentityCache(server, PHASE1_ARTIFACT.guard);
+      applyArtifact(await fetchArtifact());
+    } finally {
+      setRefreshingArtifact(false);
+    }
+  }, [server, fetchArtifact, applyArtifact]);
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -422,9 +446,15 @@ export function DeployPanel() {
       : predictedInspection?.address === predicted
         ? predictedInspection
         : { address: predicted, state: "checking" };
+  const artifactGateState = artifactGate({
+    check: artifact,
+    error: artifactError,
+    refreshing: refreshingArtifact,
+  });
+  const provenance = artifact ? artifactProvenance(artifact) : null;
   const deployControl = writeControlState(wallet, {
     busy: deploying,
-    extraDisabled: artifact?.ok !== true || currentPredictedInspection?.state !== "available",
+    extraDisabled: artifactGateState.disabled || currentPredictedInspection?.state !== "available",
     label: "deploy a guard",
   });
   useEffect(() => {
@@ -760,8 +790,24 @@ export function DeployPanel() {
             <div className="stat">
               <div className="k">Fetched from chain</div>
               <div className="v small mono">{artifact.live.fetchedSha256.slice(0, 16)}...</div>
-              <div className="n">{artifact.live.bytes} bytes</div>
+              <div className="n">{artifact.live.bytes} bytes, SHA-256</div>
             </div>
+            {provenance && (
+              <div className="stat">
+                <div className="k">Verification</div>
+                <div className="v small">{provenance.byteSourceLabel}</div>
+                <div className="n">{provenance.verifiedLabel}</div>
+              </div>
+            )}
+            {provenance && (
+              <div className="stat">
+                <div className="k">Source instance</div>
+                <div className="v small mono" title={provenance.sourceInstance}>
+                  {short(provenance.sourceInstance)}
+                </div>
+                <div className="n">the instance whose bytecode was hashed</div>
+              </div>
+            )}
             <div className="stat">
               <div className="k">Identity</div>
               <div
@@ -1114,17 +1160,11 @@ export function DeployPanel() {
         </button>
         <button
           className="secondary"
-          onClick={() => {
-            // “Re-check” means ask the chain again, so the identity cached by
-            // the last read is dropped first — otherwise a mismatch could keep
-            // answering from a cache entry that read already disproved, and the
-            // only way back to a matching artifact would be a reload (issue #351).
-            invalidateWasmIdentityCache(server, PHASE1_ARTIFACT.guard);
-            void fetchArtifact().then(applyArtifact);
-          }}
-          disabled={deploying}
+          onClick={() => void refreshArtifact()}
+          disabled={deploying || refreshingArtifact}
+          title="Drops the cached verification and reads the bytecode from the chain again"
         >
-          Re-check artifact
+          {refreshingArtifact ? "Re-verifying…" : "Re-check artifact"}
         </button>
       </div>
 

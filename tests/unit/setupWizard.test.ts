@@ -64,6 +64,8 @@ function policyMissingSnapshot(): GuardSnapshot {
         fetchedSha256: PHASE1_ARTIFACT.wasmHash,
         bytes: PHASE1_ARTIFACT.wasmBytes,
         match: true,
+        source: "network",
+        verifiedAt: "2026-09-25T10:00:00.000Z",
       },
     },
   };
