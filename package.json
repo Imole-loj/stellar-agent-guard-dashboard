@@ -36,14 +36,14 @@
   "dependencies": {
     "@stellar/freighter-api": "^6.0.1",
     "@stellar/stellar-sdk": "^17.2.1",
-    "next": "^16.3.8",
+    "next": "^16.4.6",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0",
+    "react-dom": "^19.3.1",
     "stellar-agent-guard-sdk": "file:vendor/stellar-agent-guard-sdk-0.1.1.tgz",
     "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@next/bundle-analyzer": "^16.4.2",
+    "@next/bundle-analyzer": "^16.4.3",
     "@playwright/test": "^1.64.1",
     "@types/jsdom": "^30.0.0",
     "@types/node": "^26.6.5",
@@ -53,8 +53,8 @@
     "eslint": "^9.39.0",
     "eslint-config-next": "^16.4.3",
     "fast-check": "^4.10.2",
-    "jsdom": "^30.1.1",
-    "prettier": "^3.9.9",
+    "jsdom": "^31.0.0",
+    "prettier": "^3.10.1",
     "tsx": "^4.23.15",
     "typescript": "^5.9.2"
   }
