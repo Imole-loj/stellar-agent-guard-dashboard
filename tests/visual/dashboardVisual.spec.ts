@@ -82,6 +82,15 @@ for (const screen of SCREENS) {
       await document.fonts.ready;
     });
 
+    // Playwright's `animations: "disabled"` fast-forwards finite animations on
+    // the first capture. On the console that settles a 7px layout difference
+    // *after* the first screenshot, so the first capture and the comparison
+    // would disagree on page height and the assertion would keep retrying until
+    // it timed out. One throwaway capture puts the page in the same settled
+    // state the committed baseline records; the assertion itself still captures
+    // a fresh full page.
+    await page.screenshot({ fullPage: true, animations: "disabled" });
+
     // A full-page capture rather than a viewport one: the panels below the fold
     // (the panic flow, the policy form) are exactly where a layout regression
     // would otherwise go unnoticed.
