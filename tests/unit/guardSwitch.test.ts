@@ -12,7 +12,7 @@
 
 import assert from "node:assert/strict";
 import { afterEach, before, test } from "node:test";
-import { Address, xdr } from "@stellar/stellar-sdk";
+import { xdr } from "@stellar/stellar-sdk";
 import type { rpc } from "@stellar/stellar-sdk";
 import type { ReactElement, ReactNode } from "react";
 import { AppRouterContext } from "next/dist/shared/lib/app-router-context.shared-runtime";
@@ -22,6 +22,7 @@ import { GuardProvider, useGuard } from "../../components/GuardProvider.tsx";
 import { KNOWN_INSTANCES, instanceStorageKey } from "../../lib/guard/instance.ts";
 import { scopedStorageKey } from "../../lib/guard/guardScoped.ts";
 import { guardStatusScVal } from "../mocks/sorobanFixtures.ts";
+import { decodeInvocation } from "../helpers/identityRace.ts";
 
 installDom();
 // Force the storage fallback transport so no real BroadcastChannel is left open
@@ -64,21 +65,6 @@ function statusValue(adminFrozen: boolean): xdr.ScVal {
     last_heartbeat: 1n,
     now: 2n,
   });
-}
-
-function decodeInvocation(tx: unknown): { guard: string; fn: string } {
-  const raw = xdr.TransactionEnvelope.fromXDR((tx as { toXDR(): string }).toXDR(), "base64");
-  const body = raw.type === "envelopeTypeTx" ? raw.v1.tx.operations[0]?.body : undefined;
-  const hostFunction =
-    body && body.type === "invokeHostFunction" ? body.invokeHostFunctionOp.hostFunction : undefined;
-  if (!hostFunction || hostFunction.type !== "hostFunctionTypeInvokeContract") {
-    return { guard: "", fn: "" };
-  }
-  const call = hostFunction.invokeContract;
-  return {
-    guard: Address.fromScAddress(call.contractAddress).toString(),
-    fn: String(call.functionName),
-  };
 }
 
 function createFakeServer(): FakeServer {

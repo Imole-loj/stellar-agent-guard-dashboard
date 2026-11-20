@@ -513,7 +513,15 @@ describe("operator browser-local storage controls and category isolation (#332)"
     store.setItem(
       TX_HISTORY_STORAGE_KEY,
       JSON.stringify([
-        { hash: "h1", operation: "freeze", status: "confirmed", recordedAt: "2026-10-20" },
+        // Relative to now: history older than TX_HISTORY_MAX_AGE_DAYS (30) is
+        // pruned on read, so a fixed date makes this fixture expire with the
+        // calendar instead of testing the category counts.
+        {
+          hash: "h1",
+          operation: "freeze",
+          status: "confirmed",
+          recordedAt: new Date().toISOString(),
+        },
       ]),
     );
     store.setItem(ADDRESS_BOOK_STORAGE_KEY, JSON.stringify([{ address: "GA...", alias: "Alice" }]));
@@ -618,7 +626,15 @@ describe("operator browser-local storage controls and category isolation (#332)"
     localStorage.setItem(
       TX_HISTORY_STORAGE_KEY,
       JSON.stringify([
-        { hash: "h1", operation: "freeze", status: "confirmed", recordedAt: "2026-10-20" },
+        // Relative to now: history older than TX_HISTORY_MAX_AGE_DAYS (30) is
+        // pruned on read, so a fixed date makes this fixture expire with the
+        // calendar instead of testing the category counts.
+        {
+          hash: "h1",
+          operation: "freeze",
+          status: "confirmed",
+          recordedAt: new Date().toISOString(),
+        },
       ]),
     );
 

@@ -11,6 +11,24 @@ import { defineConfig, devices } from "@playwright/test";
  * rather than a mock. The third theme, high-contrast, is reachable only through
  * the in-app toggle, so colour-scheme emulation cannot select it and it is not
  * covered here.
+ *
+ * The 375×667 and 1280×800 responsive captures (issue #39) use the two
+ * `responsive-*` projects below instead of the 1440/768/375×812 set. They are
+ * viewport-sized captures, one project per device size, so those three
+ * baselines exist exactly once (`tests/visual/responsive.spec.ts`).
+ *
+ * ## Baseline provenance
+ *
+ * Baselines are committed artifacts generated **only** in CI, inside the pinned
+ * `mcr.microsoft.com/playwright:v1.64.0-noble` container (see the
+ * `update-screenshots` job in `.github/workflows/visual-tests.yml`). The image
+ * fixes both the browser build and the font set, so a diff means the interface
+ * changed. Regenerating locally with `npm run test:visual:update` uses the
+ * developer's fonts and produces exactly the cross-OS drift these comparisons
+ * are meant to catch, therefore local `--update-snapshots` results must not be
+ * committed. To refresh them, push a commit whose message contains
+ * `update-screenshots`; the CI job rebuilds, regenerates and commits the
+ * snapshots inside the image.
  */
 
 const VIEWPORTS = [
@@ -20,6 +38,9 @@ const VIEWPORTS = [
 ] as const;
 
 const COLOR_SCHEMES = ["dark", "light"] as const;
+
+/** Files whose captures run in the dedicated responsive projects, not here. */
+const RESPONSIVE_SPEC = /responsive\.spec\.ts/;
 
 export default defineConfig({
   testDir: "./tests/visual",
@@ -42,7 +63,11 @@ export default defineConfig({
       // Less than 0.5% of pixels may differ. That headroom is for font
       // antialiasing, which is never bit-identical between runs; anything
       // structural — a shifted panel, a changed colour, a wrapped label — is far
-      // larger than half a percent.
+      // larger than half a percent. Playwright compares the per-pixel colour
+      // distance against `threshold` (the default 0.2, kept) and then allows
+      // this fraction of pixels to fall outside it; the ratio is what survives
+      // antialiasing across the CI image's font set, while a one-pixel layout
+      // shift in a panel or action bar stays well above it.
       maxDiffPixelRatio: 0.005,
       animations: "disabled",
       caret: "hide",
@@ -55,16 +80,44 @@ export default defineConfig({
     screenshot: "only-on-failure",
   },
 
-  projects: VIEWPORTS.flatMap((viewport) =>
-    COLOR_SCHEMES.map((colorScheme) => ({
-      name: `${viewport.name}-${colorScheme}`,
+  projects: [
+    ...VIEWPORTS.flatMap((viewport) =>
+      COLOR_SCHEMES.map((colorScheme) => ({
+        name: `${viewport.name}-${colorScheme}`,
+        // The responsive captures have their own two projects below; running
+        // them here too would demand six snapshots for three device sizes.
+        testIgnore: RESPONSIVE_SPEC,
+        use: {
+          ...devices["Desktop Chrome"],
+          viewport: { width: viewport.width, height: viewport.height },
+          colorScheme,
+        },
+      })),
+    ),
+    {
+      name: "responsive-mobile-375x667",
+      testMatch: RESPONSIVE_SPEC,
+      grep: /@mobile/,
       use: {
         ...devices["Desktop Chrome"],
-        viewport: { width: viewport.width, height: viewport.height },
-        colorScheme,
+        viewport: { width: 375, height: 667 },
+        // One theme per size keeps the issue's "three baselines" literal; the
+        // light/dark pair is already covered at 375 width by the mobile-light
+        // and mobile-dark projects above.
+        colorScheme: "dark",
       },
-    })),
-  ),
+    },
+    {
+      name: "responsive-desktop-1280x800",
+      testMatch: RESPONSIVE_SPEC,
+      grep: /@desktop/,
+      use: {
+        ...devices["Desktop Chrome"],
+        viewport: { width: 1280, height: 800 },
+        colorScheme: "dark",
+      },
+    },
+  ],
 
   webServer: {
     // The suite runs against the production build, never the dev server: the dev

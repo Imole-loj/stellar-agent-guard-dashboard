@@ -4,6 +4,91 @@
 that holds no keys and runs no server code, so most changes are UI, client-side Soroban
 RPC, or tests.
 
+## First run (local development walkthrough)
+
+This is a pure client-side Next.js app: there is no backend, database or API route to
+start, and no secret is required. The only network dependency is Soroban RPC; a wallet is
+needed only to _write_.
+
+### 1. Toolchain
+
+Node 24+ is required (`package.json` → `engines.node`), and `.nvmrc` pins the major:
+
+```bash
+nvm use             # reads .nvmrc (24)
+node -v             # v24.x
+```
+
+`nvm` is optional — any Node 24+ install works. Docker is only needed for
+`npm run sandbox`.
+
+### 2. Install exactly what the lockfile says
+
+```bash
+npm ci
+```
+
+**You should see:** the command exit 0 after installing the packages in
+`package-lock.json`. `npm ci` fails when the lockfile and `package.json` disagree; that
+failure is real and is fixed in the branch, never bypassed with `npm install` (see the
+lockfile ride-along rule below).
+
+### 3. Configure the network (optional)
+
+An empty `.env.local` is a working public-testnet console: every variable has a default in
+`lib/guard/network.ts`. To start from the documented template:
+
+```bash
+cp .env.example .env.local
+```
+
+Uncomment only what you need. `NEXT_PUBLIC_*` values are inlined by Next at build time, so
+restart the dev server after editing. `.env.local` is gitignored; never put a real key in
+it — this console is non-custodial and needs none.
+
+### 4. Start the console
+
+```bash
+npm run dev
+```
+
+**You should see:** the dev server report `Ready` on <http://localhost:3000>. The overview's
+status panel is honest in three states: a live value read from the chain, a pending
+skeleton while the read is in flight, or a _named read error_. A failed read is never
+rendered as `0`.
+
+No wallet? The console stays in observer mode: reads, telemetry and the storage explorer
+work, and write controls explain that a wallet is required. For a fully offline tour:
+
+```bash
+npm run dev:demo
+```
+
+**You should see:** the `DEMO MODE — Static Fixture Data` badge, a seeded telemetry feed,
+and disabled write controls (demo fixtures never touch RPC).
+
+### 5. Connect a wallet (only for writes)
+
+Install [Freighter](https://www.freighter.app/), switch it to **Testnet**, then connect
+from the wallet bar. **You should see:** your `G…` address and the network name, with write
+controls enabled. A wallet on another network is reported as a mismatch and cannot sign;
+switch networks in the wallet, then reconnect.
+
+### 6. Run the gates
+
+See [Local gates before pushing](#local-gates-before-pushing) and run every gate before
+opening a PR.
+
+### Common first-run failures
+
+| Symptom                                                | Cause and fix                                                                                                                                                                             |
+| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Error: listen EADDRINUSE … :3000`                     | Another dev server is already running. Stop it, or use another port: `npm run dev -- -p 3001` (then open <http://localhost:3001>).                                                        |
+| `npm ci` fails on `engines` or an `EBADENGINE` warning | Node is older than 24. Run `nvm use`, or install Node 24+, then run `npm ci` again.                                                                                                       |
+| The status panel says a read failed                    | The RPC endpoint is unreachable or rate-limited. Check `.env.local`'s `NEXT_PUBLIC_RPC_URL` and public-testnet status; the panel's per-read retry re-runs only the failed read.           |
+| The wallet is connected but write buttons are disabled | Freighter is on a different network. Switch it to Testnet; the mismatch banner links to the same guidance.                                                                                |
+| `/configure` shows an artifact as `unreadable`         | The pinned artifact could not be verified through RPC. Reads and the form still work, but deployment is refused until the read succeeds — that refusal is the safety property, not a bug. |
+
 ## Shared conventions
 
 Commit style, the one-commit-per-logical-unit **per file** rule, the branch lifecycle
@@ -24,6 +109,44 @@ npm run test:e2e    # Playwright browser suites (npx playwright install chromium
 npm run build       # Next.js production build
 npm run check:docs-scripts  # validates README.md + CONTRIBUTING.md references
 ```
+
+What each gate is for — a failure names the gate that caught it, so this table is the
+single home for the explanations rather than a second copy elsewhere in the docs:
+
+| Gate                         | Catches                                                                                                                                       |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run typecheck`          | Type drift the bundler would otherwise erase: a changed SDK return shape, a prop that no longer exists, a narrowed union.                     |
+| `npm run lint`               | React/Next hook-order problems, unused imports, and the repository's module-boundary rules.                                                   |
+| `npm run format:check`       | Stylistic drift Prettier owns; a format failure is retried with `npm run format`, not hand-edited.                                            |
+| `npm test`                   | Unit and fuzz behaviour: encoders/decoders, policy validation, race handling, component wiring (the suite runs each file in its own process). |
+| `npm run test:e2e`           | Real browser flows against a mocked chain: guard lifecycle, policy writes, telemetry filtering/export.                                        |
+| `npm run build`              | Production compilation, route rendering and the static-export boundary.                                                                       |
+| `npm run check:no-server`    | An accidental route handler, middleware file or server action — the zero-backend boundary is architectural.                                   |
+| `npm run test:docs`          | Broken relative links and section anchors in Markdown.                                                                                        |
+| `npm run check:docs-scripts` | A `npm run …` reference in README/CONTRIBUTING whose script no longer exists.                                                                 |
+
+### Visual regression baselines
+
+`npm run test:visual` compares the console against committed Playwright snapshots at the
+designed viewports (desktop 1440, tablet 768, mobile 375 in dark and light), plus three
+viewport-sized responsive captures from `tests/visual/responsive.spec.ts`: `/configure` at
+375×667 and 1280×800, and `/` at 1280×800 (issue #39). A difference means the interface
+changed; the report in `playwright-report/` contains the diff.
+
+**Baselines are generated only in CI**, inside the pinned
+`mcr.microsoft.com/playwright:v1.64.0-noble` image. That image fixes both the browser
+build and the font set, so a comparison cannot fail because a contributor's OS renders
+fonts differently. To refresh the committed files, push a commit whose message contains
+`update-screenshots`; the `update-screenshots` job in
+[`.github/workflows/visual-tests.yml`](./.github/workflows/visual-tests.yml) rebuilds the
+app inside the image, runs `--update-snapshots`, and pushes the refreshed files back to
+the branch.
+
+Do **not** commit the output of `npm run test:visual:update` from a developer machine.
+It uses local fonts and produces exactly the cross-OS drift these snapshots exist to
+catch, and the next CI run would diff against pixels it cannot reproduce. The tolerance
+(`maxDiffPixelRatio: 0.005`, with the rationale for that value) is documented once beside
+the assertion config in [`playwright.visual.config.ts`](./playwright.visual.config.ts).
 
 These extra scripts are not part of the CI gate:
 
@@ -62,27 +185,27 @@ the docs reference only through the bare `npm test` form are not counted by the 
 (it matches `npm run …` literally) but are listed here for completeness. The current
 inventory is:
 
-| Script                                    | Documented in README/CONTRIBUTING                               | Verdict                                                                      |
-| ----------------------------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `dev`                                     | Yes — quick start                                               | documented                                                                   |
-| `dev:demo`                                | Yes — demo mode section                                         | documented                                                                   |
-| `build`                                   | Yes — verification block                                        | documented                                                                   |
-| `lint`                                    | Yes — verification block                                        | documented                                                                   |
-| `typecheck`                               | Yes — verification block                                        | documented                                                                   |
-| `check:docs-scripts`                      | Yes — this section and the Documentation links section          | documented                                                                   |
-| `format`                                  | Yes — lockfile section                                          | documented                                                                   |
-| `changelog`                               | Yes — lockfile section and Changelog section                    | documented                                                                   |
-| `test:docs`                               | Yes — Documentation links section                               | documented                                                                   |
-| `sandbox`                                 | Yes — Local sandbox section                                     | documented                                                                   |
-| `test:e2e`                                | Yes — verification block, branch-protection section             | documented                                                                   |
-| `test:perf`                               | Yes — extra scripts note                                        | documented                                                                   |
-| `prove:phase3`                            | Yes — extra scripts note                                        | documented                                                                   |
-| `prove:phase3:emit` / `prove:phase3:diff` | Yes — extra scripts note                                        | documented                                                                   |
-| `inspect`                                 | Yes — verification block and extra scripts note                 | documented                                                                   |
-| `test`                                    | Yes — verification block, but as `npm test` (bare `npm test …`) | informational (no `npm run test` reference yet)                              |
-| `start`                                   | No                                                              | intentional-with-note (local runtime entrypoint, kept out of the docs)       |
-| `export`                                  | No                                                              | informational (static-export entrypoint, not user documentation)             |
-| `test:visual` / `test:visual:update`      | No                                                              | informational (visual regression entrypoints, see the visual-tests workflow) |
+| Script                                    | Documented in README/CONTRIBUTING                               | Verdict                                                                |
+| ----------------------------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `dev`                                     | Yes — quick start                                               | documented                                                             |
+| `dev:demo`                                | Yes — demo mode section                                         | documented                                                             |
+| `build`                                   | Yes — verification block                                        | documented                                                             |
+| `lint`                                    | Yes — verification block                                        | documented                                                             |
+| `typecheck`                               | Yes — verification block                                        | documented                                                             |
+| `check:docs-scripts`                      | Yes — this section and the Documentation links section          | documented                                                             |
+| `format`                                  | Yes — lockfile section                                          | documented                                                             |
+| `changelog`                               | Yes — lockfile section and Changelog section                    | documented                                                             |
+| `test:docs`                               | Yes — Documentation links section                               | documented                                                             |
+| `sandbox`                                 | Yes — Local sandbox section                                     | documented                                                             |
+| `test:e2e`                                | Yes — verification block, branch-protection section             | documented                                                             |
+| `test:perf`                               | Yes — extra scripts note                                        | documented                                                             |
+| `prove:phase3`                            | Yes — extra scripts note                                        | documented                                                             |
+| `prove:phase3:emit` / `prove:phase3:diff` | Yes — extra scripts note                                        | documented                                                             |
+| `inspect`                                 | Yes — verification block and extra scripts note                 | documented                                                             |
+| `test`                                    | Yes — verification block, but as `npm test` (bare `npm test …`) | informational (no `npm run test` reference yet)                        |
+| `start`                                   | No                                                              | intentional-with-note (local runtime entrypoint, kept out of the docs) |
+| `export`                                  | No                                                              | informational (static-export entrypoint, not user documentation)       |
+| `test:visual` / `test:visual:update`      | Yes — Visual regression baselines                               | documented (baselines are regenerated in CI only)                      |
 
 ## Pre-commit hook
 
