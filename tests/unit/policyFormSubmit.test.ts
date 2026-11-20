@@ -70,7 +70,7 @@ type Call = "getAccount" | "simulate" | "sign" | "send" | "getTransaction";
 interface PipelineServer {
   server: rpc.Server;
   calls: Call[];
-  /** The set_policy argument the first simulation carried. */
+  /** The policy argument the first simulation carried (the read-only preflight). */
   policyArgs: () => unknown[];
 }
 
@@ -308,11 +308,12 @@ test("happy path: encode → simulate → sign → broadcast → poll → re-rea
     assert.deepEqual(policy.assets, [TOKEN]);
     assert.deepEqual(policy.recipients, [RECIPIENT]);
 
-    // Discovery simulation, enforced simulation, wallet signature, broadcast,
-    // inclusion poll — in that order, with nothing skipped.
+    // Read-only `validate_policy` preflight, discovery simulation, enforced
+    // simulation, wallet signature, broadcast, inclusion poll — in that order,
+    // with nothing skipped.
     assert.deepEqual(
       harness.fake.calls.filter((call) => call !== "getAccount"),
-      ["simulate", "simulate", "sign", "send", "getTransaction"],
+      ["simulate", "simulate", "simulate", "sign", "send", "getTransaction"],
     );
     assert.equal(harness.refreshes, 1, "a landed write re-reads the guard");
     assert.match(harness.container.textContent ?? "", /set_policy landed on chain/);
