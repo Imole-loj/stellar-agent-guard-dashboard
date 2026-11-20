@@ -174,7 +174,14 @@ function snapshot(): GuardSnapshot {
     window: { ok: true, value: null },
     identity: {
       ok: true,
-      value: { reportedWasmHash: null, fetchedSha256: "", bytes: 0, match: false },
+      value: {
+        reportedWasmHash: null,
+        fetchedSha256: "",
+        bytes: 0,
+        match: false,
+        source: "network",
+        verifiedAt: new Date().toISOString(),
+      },
     },
   };
 }
