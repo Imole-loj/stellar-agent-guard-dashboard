@@ -59,6 +59,19 @@ describe("TelemetryFeed", () => {
       server: {} as any,
       guard: "test_guard",
       stream: { paused: false, pendingCount: 0 },
+      // The declared feed shape, in full: `TelemetryAlerts` reads
+      // `feed.guards` to scope its alert dedupe (#313), and a mock that omits
+      // it would crash the panel rather than describe a feed that has not
+      // started tailing.
+      feed: {
+        watching: false,
+        latestLedger: null,
+        error: null,
+        lastPolledAt: null,
+        guards: [],
+        capped: 0,
+        cappedLabels: [],
+      },
       startWatching: () => {},
       stopWatching: () => {},
       pauseStream: () => {},
@@ -66,7 +79,11 @@ describe("TelemetryFeed", () => {
       clearEvents: () => {},
       pushEvents: () => {},
     };
-    return { ...defaults, ...overrides };
+    return {
+      ...defaults,
+      ...overrides,
+      feed: { ...defaults.feed, ...(overrides.feed ?? {}) },
+    };
   }
 
   function renderFeed(mockValue: any) {

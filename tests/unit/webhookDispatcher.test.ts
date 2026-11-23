@@ -27,7 +27,9 @@ import {
   WEBHOOK_EVENT_TYPES,
   WEBHOOK_PAYLOAD_VERSION,
   WEBHOOK_PING_EVENT,
+  WEBHOOK_EVENT_HEADER,
   WEBHOOK_SIGNATURE_HEADER,
+  WEBHOOK_TIMESTAMP_HEADER,
   buildVerificationPing,
   buildWebhookPayload,
   buildWebhookRequest,
@@ -156,6 +158,73 @@ describe("buildWebhookPayload / serializeWebhookPayload", () => {
   });
 });
 
+// ── What a test send puts on the wire (issue #315) ─────────────────────────
+
+describe("a verification ping sends only what it says it sends", () => {
+  // Material the console can hold that must never leave the tab: a wallet's
+  // secret seed and a signed transaction envelope. Neither is ever *read* by
+  // the ping builder — this pins that the ping's own shape cannot smuggle one
+  // in, and that a configured signing secret never reaches a ping's body.
+  const WALLET_SECRET_SEED = "SBVIJ3NY42FQK5EUMDH6JYF3O6F2W5WVOE7T6U5H3N3LJN3TILYHSGCA";
+  const SIGNED_XDR =
+    "AAAAAgAAAAA69JytbNnHXpU8Vh1yQ3B5L9m0R3s7T2uV6wXzY1aBcDeRgAAAB9AAAACgAAAAAAAAAAAAAAAA";
+
+  test("the ping's details are exactly the three fields a receiver needs", () => {
+    const ping = buildVerificationPing({ guard: GUARD, network: "testnet", timestamp: TIMESTAMP });
+    assert.deepEqual(Object.keys(ping.details).sort(), [
+      "dashboard",
+      "expected_event_types",
+      "message",
+    ]);
+    assert.deepEqual(Object.keys(ping).sort(), [
+      "details",
+      "event",
+      "guard",
+      "network",
+      "signed",
+      "timestamp",
+      "version",
+    ]);
+  });
+
+  test("the bytes a test send POSTs carry no secret, no key and no XDR", async () => {
+    const recording = recordingFetch(() => ({ status: 200 }));
+    const result = await dispatchWebhook(
+      buildVerificationPing({ guard: GUARD, network: "testnet", timestamp: TIMESTAMP }),
+      // The console is configured *with* a signing secret: a ping must not
+      // inline it, and must not ask the receiver to verify a signature it has
+      // no claim to carry.
+      settings({ secret: SECRET }),
+      { fetch: recording.fetch },
+    );
+    assert.equal(result.outcome, "sent");
+    assert.equal(recording.calls.length, 1);
+    const call = recording.calls[0]!;
+    const body = String(call.init.body ?? "");
+    assert.match(body, /Verification ping/);
+    const headers = Object.entries(call.init.headers as Record<string, string>);
+
+    for (const material of [SECRET, WALLET_SECRET_SEED, SIGNED_XDR]) {
+      assert.ok(!body.includes(material), `the request body leaked ${material}`);
+      assert.ok(
+        !headers.some(([name, value]) => name.includes(material) || value.includes(material)),
+        `a request header leaked ${material}`,
+      );
+    }
+    const parsed = JSON.parse(body) as WebhookPayload;
+    assert.equal(parsed.signed, false, "a ping declares itself unsigned");
+    assert.ok(
+      !headers.some(([name]) => name === WEBHOOK_SIGNATURE_HEADER),
+      "an unsigned ping sends no signature header",
+    );
+    assert.deepEqual(
+      headers.map(([name]) => name).sort(),
+      ["Content-Type", WEBHOOK_EVENT_HEADER, WEBHOOK_TIMESTAMP_HEADER].sort(),
+      "the ping's headers are the envelope it describes and nothing else",
+    );
+  });
+});
+
 // ── Signing ────────────────────────────────────────────────────────────────
 
 describe("signWebhookBody", () => {
@@ -253,22 +322,81 @@ describe("dispatchWebhook", () => {
     assert.match(result.error ?? "", /500/);
   });
 
-  test("a request that never completes is `failed`, and never throws", async () => {
-    const { fetch: stub } = recordingFetch(() => {
+  test("a request that never reaches the host is `network`, and never throws", async () => {
+    // The probe answers the question `fetch` cannot: the host did not respond to
+    // the no-CORS GET either, so this is an address that does not answer, not a
+    // browser refusing a cross-origin POST.
+    const { fetch: stub, calls } = recordingFetch(() => {
       throw new TypeError("Failed to fetch");
     });
     const result = await dispatchWebhook(payload(), settings({ secret: SECRET }), { fetch: stub });
     assert.equal(result.ok, false);
-    assert.equal(result.outcome, "failed");
+    assert.equal(result.outcome, "network");
     assert.equal(result.status, null);
     assert.match(result.error ?? "", /Failed to fetch/);
+    assert.equal(calls.length, 2, "the failed POST was followed by the reachability probe");
+    assert.equal(calls[1]!.init.method, "GET");
+    assert.equal(calls[1]!.init.mode, "no-cors");
+    assert.equal(calls[1]!.init.body, undefined, "the probe carries no payload");
   });
 
   test("an async rejection is caught the same way as a synchronous throw", async () => {
     const { fetch: stub } = recordingFetch(() => Promise.reject(new Error("network down")));
     const result = await dispatchWebhook(payload(), settings({ secret: SECRET }), { fetch: stub });
-    assert.equal(result.outcome, "failed");
+    assert.equal(result.outcome, "network");
     assert.match(result.error ?? "", /network down/);
+  });
+
+  test("a host that answers the probe is a CORS refusal, not an unreachable URL", async () => {
+    // The distinction an operator acts on: `cors` means the endpoint's owner has
+    // to allow this origin, `network` means the address itself is wrong.
+    const { fetch: stub } = recordingFetch((url, init) => {
+      if (init.mode === "no-cors") return { status: 200 };
+      throw new TypeError("Failed to fetch");
+    });
+    const result = await dispatchWebhook(payload(), settings({ secret: SECRET }), { fetch: stub });
+    assert.equal(result.ok, false);
+    assert.equal(result.outcome, "cors");
+    assert.match(result.error ?? "", /Failed to fetch/);
+  });
+
+  test("an offline browser is reported as offline, without probing", async () => {
+    const { fetch: stub, calls } = recordingFetch(() => {
+      throw new TypeError("Failed to fetch");
+    });
+    const result = await dispatchWebhook(payload(), settings({ secret: SECRET }), {
+      fetch: stub,
+      isOffline: () => true,
+    });
+    assert.equal(result.outcome, "network");
+    assert.match(result.error ?? "", /offline/);
+    assert.equal(calls.length, 1, "a probe from an offline browser can only fail the same way");
+  });
+
+  test("an endpoint that never answers times out instead of hanging the panel", async () => {
+    // `never` here is the failure being tested for: a stub that ignores the
+    // abort signal, exactly as an old browser or a hung socket does. The bound
+    // is what stops the "Test webhook" button sitting on "Sending…" forever.
+    const never: typeof fetch = (() => new Promise(() => {})) as unknown as typeof fetch;
+    const started = Date.now();
+    const result = await dispatchWebhook(payload(), settings({ secret: SECRET }), {
+      fetch: never,
+      timeoutMs: 30,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.outcome, "timeout");
+    assert.match(result.error ?? "", /did not answer within/);
+    assert.ok(Date.now() - started < 5_000, "the deadline is what returns the answer");
+  });
+
+  test("the send is given an abort signal so a hung request can be abandoned", async () => {
+    const { fetch: stub, calls } = recordingFetch(() => ({ status: 200 }));
+    await dispatchWebhook(payload(), settings({ secret: SECRET }), { fetch: stub, timeoutMs: 60 });
+    assert.ok(
+      calls[0]!.init.signal instanceof AbortSignal,
+      "the deadline travels with the request",
+    );
+    assert.equal(calls[0]!.init.signal!.aborted, false, "a completed send is not cancelled");
   });
 
   test("a disabled dispatcher sends nothing and says why", async () => {
@@ -672,7 +800,15 @@ describe("describeDispatch", () => {
       describeDispatch({ ok: true, outcome: "sent", status: 200, error: null, payload: base }),
       /Delivered/,
     );
-    for (const outcome of ["rate-limited", "skipped", "rejected", "failed"] as const) {
+    for (const outcome of [
+      "rate-limited",
+      "skipped",
+      "rejected",
+      "timeout",
+      "cors",
+      "network",
+      "failed",
+    ] as const) {
       const text = describeDispatch({
         ok: false,
         outcome,
@@ -725,5 +861,42 @@ describe("describeDispatch", () => {
       }),
       /Failed to fetch/,
     );
+  });
+
+  test("a timeout is never described as a non-delivery", () => {
+    const payload = buildWebhookPayload({
+      event: "FREEZE_ACTIVATED",
+      guard: GUARD,
+      network: "testnet",
+      timestamp: TIMESTAMP,
+    });
+    const text = describeDispatch({
+      ok: false,
+      outcome: "timeout",
+      status: null,
+      error: null,
+      payload,
+    });
+    // The request may have arrived and only the response was lost, so the copy
+    // has to tell the operator not to read this as "nothing got through".
+    assert.match(text, /may still have received/);
+    assert.doesNotMatch(text, /never reached|was not (?:sent|delivered)/i);
+  });
+
+  test("cors and network are told apart, and each names the next thing to check", () => {
+    const payload = buildWebhookPayload({
+      event: "FREEZE_ACTIVATED",
+      guard: GUARD,
+      network: "testnet",
+      timestamp: TIMESTAMP,
+    });
+    const result = (outcome: "timeout" | "cors" | "network") =>
+      describeDispatch({ ok: false, outcome, status: null, error: null, payload });
+    // Both present as the same transport error in the browser; the whole point
+    // of the classification is that the operator gets different guidance.
+    assert.match(result("cors"), /origin/i);
+    assert.match(result("network"), /address|network access/i);
+    assert.notEqual(result("cors"), result("network"));
+    assert.notEqual(result("timeout"), result("network"));
   });
 });

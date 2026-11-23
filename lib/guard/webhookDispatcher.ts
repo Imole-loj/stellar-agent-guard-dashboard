@@ -509,7 +509,13 @@ export type DispatchOutcome =
   | "skipped"
   /** The endpoint answered, and not with success. */
   | "rejected"
-  /** The request never completed: DNS, TLS, CORS, offline. */
+  /** The endpoint never answered inside the deadline. */
+  | "timeout"
+  /** The host answered, but the browser would not let this page send to it. */
+  | "cors"
+  /** The request never reached the host: offline, DNS or TLS. */
+  | "network"
+  /** The send could not be attempted or understood: no `fetch`, or a payload that could not be built. */
   | "failed";
 
 export interface DispatchResult {
@@ -521,10 +527,58 @@ export interface DispatchResult {
   payload: WebhookPayload;
 }
 
+/**
+ * How long to wait for an endpoint before the attempt is called a timeout.
+ *
+ * The bound is what makes "Test webhook" usable: without it, an endpoint that
+ * accepts the connection and never answers leaves the button on "Sending…" for
+ * as long as the browser's own socket timeout says — which is minutes, during an
+ * incident. Ten seconds is past any honest webhook's response time and short
+ * enough that an operator notices it.
+ */
+export const WEBHOOK_TIMEOUT_MS = 10_000;
+
 export interface DispatchDeps {
   /** Injected so tests never touch the network. */
   fetch?: typeof fetch;
   nowMs?: number;
+  /** Deadline override, so a test can watch an endpoint that never answers time out. */
+  timeoutMs?: number;
+  /** Test seam for "this browser says it has no network at all". */
+  isOffline?: () => boolean;
+}
+
+/** Raised when the deadline fires, so the failure reads as a timeout, not a `fetch` error. */
+class WebhookTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`The endpoint did not answer within ${Math.round(timeoutMs / 1000)}s.`);
+    this.name = "WebhookTimeoutError";
+  }
+}
+
+/**
+ * Whether the host answers at HTTP level at all.
+ *
+ * `fetch` cannot read a cross-origin failure: the rejection is deliberately
+ * opaque, and "CORS blocked" and "nothing is listening" arrive as the same
+ * `TypeError`. This asks the one question the browser will still answer — does a
+ * simple no-CORS request reach the host? An opaque response means a connection
+ * was made, which is what separates an endpoint that does not allow this origin
+ * from an address that does not exist. The probe is a bare GET with no body and
+ * no custom headers, so it cannot preflight and carries no payload.
+ */
+async function hostAnswers(url: string, doFetch: typeof fetch): Promise<boolean> {
+  try {
+    await doFetch(url, { method: "GET", mode: "no-cors", cache: "no-store" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The browser's own "am I online" flag, which is the cheapest network fact there is. */
+function browserReportsOffline(): boolean {
+  return typeof navigator !== "undefined" && navigator.onLine === false;
 }
 
 /**
@@ -533,9 +587,11 @@ export interface DispatchDeps {
  * A webhook is an outbound call to somebody else's infrastructure, so every
  * failure mode has to survive as a value: a dispatcher that throws into a
  * render effect takes the console down with a misconfigured URL. The
- * distinctions that matter to an operator are preserved — `rejected` (the
- * endpoint answered 4xx/5xx, so the payload or the URL is wrong) is a different
-  problem from `failed` (the request never arrived).
+ * distinctions that matter to an operator are preserved, and they are four
+ * different fixes: `rejected` (the endpoint answered 4xx/5xx — wrong payload or
+ * wrong path), `timeout` (it did not answer — the endpoint is up and the alert
+ * may still have landed), `cors` (the host is fine but does not allow this page
+ * — the endpoint has to change) and `network` (nothing answered at that address).
  */
 export async function dispatchWebhook(
   payload: WebhookPayload,
@@ -564,6 +620,8 @@ export async function dispatchWebhook(
   if (typeof doFetch !== "function") {
     return notSent("failed", "This browser has no fetch, so nothing could be sent.");
   }
+  const timeoutMs = deps.timeoutMs ?? WEBHOOK_TIMEOUT_MS;
+  const isOffline = deps.isOffline ?? browserReportsOffline;
 
   let request: WebhookRequest;
   try {
@@ -572,8 +630,22 @@ export async function dispatchWebhook(
     return notSent("failed", error instanceof Error ? error.message : String(error));
   }
 
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), timeoutMs);
+  // The signal is the polite way to give up; this promise is the guarantee. A
+  // `fetch` that ignores `signal` — an older browser, a test stub — would
+  // otherwise leave the panel waiting for an answer that never comes.
+  const gaveUp = new Promise<never>((_resolve, reject) => {
+    const onAbort = () => reject(new WebhookTimeoutError(timeoutMs));
+    if (controller.signal.aborted) onAbort();
+    else controller.signal.addEventListener("abort", onAbort, { once: true });
+  });
+
   try {
-    const response = await doFetch(request.url, request.init);
+    const response = await Promise.race([
+      doFetch(request.url, { ...request.init, signal: controller.signal }),
+      gaveUp,
+    ]);
     const status = typeof response.status === "number" ? response.status : null;
     if (status !== null && (status < 200 || status >= 300)) {
       return {
@@ -586,13 +658,24 @@ export async function dispatchWebhook(
     }
     return { ok: true, outcome: "sent", status, error: null, payload };
   } catch (error) {
-    return {
-      ok: false,
-      outcome: "failed",
-      status: null,
-      error: error instanceof Error ? error.message : String(error),
-      payload,
-    };
+    if (error instanceof WebhookTimeoutError || controller.signal.aborted) {
+      return {
+        ok: false,
+        outcome: "timeout",
+        status: null,
+        error: error instanceof Error ? error.message : String(error),
+        payload,
+      };
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    if (isOffline()) {
+      return notSent("network", `${message} This browser reports that it is offline.`);
+    }
+    // The browser collapsed two very different failures into one `TypeError`, so
+    // ask which of them it was instead of guessing from the message text.
+    return notSent((await hostAnswers(request.url, doFetch)) ? "cors" : "network", message);
+  } finally {
+    clearTimeout(deadline);
   }
 }
 
@@ -773,8 +856,16 @@ export function describeDispatch(result: DispatchResult): string {
       return result.error ?? "Nothing was sent.";
     case "rejected":
       return `The endpoint refused it${result.status === null ? "" : ` (${result.status})`}. Check the URL and the payload format.`;
+    case "timeout":
+      // The one outcome that must not be read as "not delivered": the request
+      // may well have arrived and only the response was lost.
+      return `The endpoint did not answer in time${result.error === null ? "" : `: ${result.error}`}. It may still have received the alert, so do not treat this as proof that nothing arrived.`;
+    case "cors":
+      return "The host answered, but the browser would not let this page send to it: the endpoint has to allow this console's origin (CORS). Until it does, no alert from this tab can reach that URL.";
+    case "network":
+      return `The request never reached the host${result.error === null ? "" : `: ${result.error}`}. Check the address, and that this machine has network access.`;
     case "failed":
-      return `The request never completed${result.error === null ? "" : `: ${result.error}`}. A browser will also refuse a cross-origin webhook the endpoint does not allow.`;
+      return `The request could not be sent${result.error === null ? "" : `: ${result.error}`}.`;
   }
 }
 

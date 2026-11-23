@@ -26,6 +26,7 @@ import {
   WEBHOOK_EVENT_HINTS,
   WEBHOOK_EVENT_LABELS,
   WEBHOOK_EVENT_TYPES,
+  WEBHOOK_TIMEOUT_MS,
   buildVerificationPing,
   describeDispatch,
   dispatchWebhook,
@@ -47,6 +48,21 @@ const COOLDOWN_OPTIONS: Array<{ valueMs: number; label: string }> = [
   { valueMs: 300_000, label: "at most every 5 minutes" },
   { valueMs: 900_000, label: "at most every 15 minutes" },
 ];
+
+/**
+ * The result headline, worded no stronger than the outcome warrants (#315).
+ *
+ * A timeout is the one failure that cannot be reported as "was not delivered":
+ * the request may have reached the endpoint and only the response was lost. For
+ * a security alert, a false "nothing got through" is worse than an honest
+ * "unknown" — the operator would conclude their endpoint is dead when it may be
+ * sitting on the alert.
+ */
+export function pingHeadline(ping: DispatchResult): string {
+  if (ping.ok) return "Test webhook delivered";
+  if (ping.outcome === "timeout") return "Test webhook outcome unknown";
+  return "Test webhook was not delivered";
+}
 
 export function WebhookSettingsButton() {
   const [open, setOpen] = useState(false);
@@ -136,7 +152,7 @@ export function WebhookSettingsModal({ onClose }: { onClose: () => void }) {
     setPing(result);
     setTesting(false);
     announce(
-      result.ok ? "Test webhook delivered" : `Test webhook failed: ${describeDispatch(result)}`,
+      result.ok ? "Test webhook delivered" : `${pingHeadline(result)}: ${describeDispatch(result)}`,
       result.ok ? "polite" : "assertive",
     );
   }
@@ -275,8 +291,14 @@ export function WebhookSettingsModal({ onClose }: { onClose: () => void }) {
             role="status"
             data-testid="webhook-test-result"
           >
-            <strong>{ping.ok ? "Test webhook delivered" : "Test webhook was not delivered"}</strong>
+            <strong>{pingHeadline(ping)}</strong>
             <div className="tiny">{describeDispatch(ping)}</div>
+            {ping.outcome === "timeout" && (
+              <div className="tiny">
+                The console gives up after {Math.round(WEBHOOK_TIMEOUT_MS / 1000)}s. An endpoint
+                that answers slower than that still counts as unreachable from this page.
+              </div>
+            )}
           </div>
         )}
 
