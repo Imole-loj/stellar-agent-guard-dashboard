@@ -8,11 +8,17 @@ import { refreshSources, type RefreshSource } from "../lib/guard/refreshStatus.t
 import {
   pollFleet,
   defaultSortDirection,
+  computeFleetRiskSummary,
+  getAllFleetTags,
+  addGuardTag,
+  removeGuardTag,
+  setPreferredDisplayName,
   generateFleetPolicyReport,
   formatFleetPolicyReportMarkdown,
   type FleetRow,
   type DerivedStatus,
   type SortKey,
+  type FleetRiskSummary,
   type FleetPolicyReport,
 } from "../lib/guard/fleet.ts";
 import {
@@ -585,6 +591,18 @@ export function FleetTable() {
                         Status
                       </th>
                     );
+                  case "policyAge":
+                    return (
+                      <th key="policyAge" scope="col">
+                        Policy Age
+                      </th>
+                    );
+                  case "tags":
+                    return (
+                      <th key="tags" scope="col">
+                        Tags
+                      </th>
+                    );
                   case "spend":
                     return (
                       <th key="spend" scope="col">
@@ -695,17 +713,48 @@ export function FleetTable() {
                               type="checkbox"
                               checked={selected.includes(row.contact.address)}
                               onChange={() => toggleSelected(row.contact.address)}
-                              aria-label={`Select ${row.contact.label}`}
+                              aria-label={`Select ${row.displayName || row.contact.label}`}
                             />
                           </td>
                         );
                       case "guard":
                         return (
                           <td key="guard" data-label="Guard">
-                            <div>
-                              <strong>{row.contact.label}</strong>
+                            <div className="row" style={{ alignItems: "center", gap: 6 }}>
+                              <strong data-testid={`display-name-${row.contact.address}`}>
+                                {row.displayName || row.contact.label}
+                              </strong>
+                              <button
+                                type="button"
+                                className="secondary"
+                                data-testid={`edit-display-name-${row.contact.address}`}
+                                style={{ padding: "1px 5px", fontSize: "0.7em" }}
+                                title="Edit local display name"
+                                onClick={() => {
+                                  const currentName = row.displayName || row.contact.label;
+                                  const nextName = prompt(
+                                    "Enter preferred display name (browser-local):",
+                                    currentName,
+                                  );
+                                  if (nextName !== null) {
+                                    setPreferredDisplayName(
+                                      NETWORK.name,
+                                      row.contact.address,
+                                      nextName,
+                                    );
+                                    setRefreshKey((k) => k + 1);
+                                  }
+                                }}
+                              >
+                                edit
+                              </button>
                             </div>
-                            <div className="mono tiny">{starLink(row.contact.address)}</div>
+                            <div
+                              className="mono tiny"
+                              data-testid={`full-address-${row.contact.address}`}
+                            >
+                              {starLink(row.contact.address)}
+                            </div>
                           </td>
                         );
                       case "network":
@@ -718,6 +767,76 @@ export function FleetTable() {
                         return (
                           <td key="status" data-label="Status">
                             {renderStatus(row.derivedStatus)}
+                          </td>
+                        );
+                      case "policyAge":
+                        return (
+                          <td
+                            key="policyAge"
+                            className="tiny"
+                            data-label="Policy Age"
+                            data-testid={`policy-age-${row.contact.address}`}
+                          >
+                            {row.policyAge?.display ?? "unavailable"}
+                          </td>
+                        );
+                      case "tags":
+                        return (
+                          <td key="tags" data-label="Tags">
+                            <div
+                              className="row"
+                              style={{ gap: 4, flexWrap: "wrap", alignItems: "center" }}
+                            >
+                              {row.tags && row.tags.length > 0 ? (
+                                row.tags.map((tag) => (
+                                  <span
+                                    key={tag}
+                                    className="pill tiny"
+                                    data-testid={`tag-pill-${tag}`}
+                                    style={{ display: "inline-flex", alignItems: "center", gap: 3 }}
+                                  >
+                                    {tag}
+                                    <button
+                                      type="button"
+                                      aria-label={`Remove tag ${tag}`}
+                                      data-testid={`remove-tag-${tag}`}
+                                      style={{
+                                        background: "none",
+                                        border: "none",
+                                        cursor: "pointer",
+                                        padding: 0,
+                                        fontSize: "10px",
+                                        lineHeight: 1,
+                                      }}
+                                      onClick={() => {
+                                        removeGuardTag(NETWORK.name, row.contact.address, tag);
+                                        setRefreshKey((k) => k + 1);
+                                      }}
+                                    >
+                                      ×
+                                    </button>
+                                  </span>
+                                ))
+                              ) : (
+                                <span className="tiny muted">—</span>
+                              )}
+                              <button
+                                type="button"
+                                className="secondary"
+                                data-testid={`add-tag-btn-${row.contact.address}`}
+                                style={{ padding: "1px 5px", fontSize: "0.7em" }}
+                                title="Add browser-local tag"
+                                onClick={() => {
+                                  const tag = prompt("Enter tag name (browser-local):");
+                                  if (tag && tag.trim()) {
+                                    addGuardTag(NETWORK.name, row.contact.address, tag.trim());
+                                    setRefreshKey((k) => k + 1);
+                                  }
+                                }}
+                              >
+                                + tag
+                              </button>
+                            </div>
                           </td>
                         );
                       case "spend":
@@ -1486,6 +1605,148 @@ export function RegistryMergeModal({
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Read-only fleet risk summary card (issue #475).
+ * Aggregates only successful live reads; lists failed/excluded guards explicitly.
+ */
+export function FleetRiskSummaryCard({
+  rows,
+  onSelectGuard,
+}: {
+  rows: FleetRow[];
+  onSelectGuard: (address: string) => void;
+}) {
+  const summary = useMemo(() => computeFleetRiskSummary(rows), [rows]);
+
+  return (
+    <div
+      className="notice info"
+      role="region"
+      aria-label="Fleet Risk Summary"
+      data-testid="fleet-risk-summary"
+      style={{ marginBottom: 14 }}
+    >
+      <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+        <strong>Live Fleet Risk Summary (Read-Only)</strong>
+        <span className="tiny muted">
+          Aggregated from {summary.successfulReads} successful read
+          {summary.successfulReads !== 1 ? "s" : ""}
+        </span>
+      </div>
+
+      <div
+        className="row"
+        style={{ gap: 12, marginTop: 8, flexWrap: "wrap", alignItems: "center" }}
+      >
+        <div
+          data-testid="risk-card-frozen"
+          className="row"
+          style={{ gap: 6, alignItems: "center" }}
+        >
+          <span className="pill danger tiny">{summary.frozen.length} Frozen</span>
+          {summary.frozen.map((item) => (
+            <button
+              key={item.address}
+              type="button"
+              className="secondary"
+              style={{ padding: "2px 6px", fontSize: "0.75em" }}
+              onClick={() => onSelectGuard(item.address)}
+              title={`Inspect frozen guard ${item.label}`}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+
+        <div
+          data-testid="risk-card-expired"
+          className="row"
+          style={{ gap: 6, alignItems: "center" }}
+        >
+          <span className="pill warn tiny">{summary.expiredDms.length} DMS Expired</span>
+          {summary.expiredDms.map((item) => (
+            <button
+              key={item.address}
+              type="button"
+              className="secondary"
+              style={{ padding: "2px 6px", fontSize: "0.75em" }}
+              onClick={() => onSelectGuard(item.address)}
+              title={`Inspect expired DMS guard ${item.label}`}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+
+        <div
+          data-testid="risk-card-missing-policy"
+          className="row"
+          style={{ gap: 6, alignItems: "center" }}
+        >
+          <span className="pill warn tiny">{summary.missingPolicy.length} Missing Policy</span>
+          {summary.missingPolicy.map((item) => (
+            <button
+              key={item.address}
+              type="button"
+              className="secondary"
+              style={{ padding: "2px 6px", fontSize: "0.75em" }}
+              onClick={() => onSelectGuard(item.address)}
+              title={`Inspect missing-policy guard ${item.label}`}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+
+        <div
+          data-testid="risk-card-healthy"
+          className="row"
+          style={{ gap: 6, alignItems: "center" }}
+        >
+          <span className="pill ok tiny">{summary.activeHealthy.length} Healthy</span>
+        </div>
+      </div>
+
+      {summary.failedOrExcluded.length > 0 && (
+        <div
+          data-testid="excluded-guards-list"
+          style={{
+            marginTop: 8,
+            paddingTop: 6,
+            borderTop: "1px solid rgba(0,0,0,0.08)",
+          }}
+        >
+          <span className="tiny warn">
+            Excluded from live summary ({summary.failedOrExcluded.length} read failed / offline):
+          </span>
+          <ul className="tiny muted" style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+            {summary.failedOrExcluded.map((entry) => (
+              <li key={entry.address}>
+                <button
+                  type="button"
+                  style={{
+                    background: "none",
+                    border: "none",
+                    padding: 0,
+                    color: "inherit",
+                    textDecoration: "underline",
+                    cursor: "pointer",
+                    fontSize: "inherit",
+                  }}
+                  onClick={() => onSelectGuard(entry.address)}
+                >
+                  {entry.label} ({entry.address.slice(0, 8)}…)
+                </button>
+                {entry.error ? ` — ${entry.error}` : " — read unconfirmed"}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }
