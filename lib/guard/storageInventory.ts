@@ -2,7 +2,6 @@ import { ADDRESS_BOOK_STORAGE_KEY } from "./addressBook.ts";
 import { ALERT_SETTINGS_STORAGE_KEY } from "./audioAlert.ts";
 import { BYTECODE_CACHE_STORAGE_KEY } from "./bytecodeCache.ts";
 import { DENSITY_STORAGE_KEY } from "./densityStore.ts";
-import { FLEET_VIEW_STORAGE_KEY } from "./fleetTableState.ts";
 import { SCOPED_STORAGE_BASES, SCOPED_STORAGE_PREFIX } from "./guardScoped.ts";
 import { INSTANCE_STORAGE_PREFIX, LEGACY_INSTANCE_STORAGE_KEY } from "./instance.ts";
 import { LAYOUT_STORAGE_KEY, NAMED_LAYOUTS_STORAGE_KEY } from "./layoutStore.ts";
@@ -13,7 +12,11 @@ import { PRIVACY_MASK_STORAGE_KEY } from "./privacyStore.ts";
 import { IDLE_TIMEOUT_STORAGE_KEY } from "./useIdleTimer.ts";
 import { PREFERRED_WALLET_STORAGE_KEY } from "./walletConnector.ts";
 import { WEBHOOK_SETTINGS_STORAGE_KEY } from "./webhookDispatcher.ts";
-import { SIDEBAR_COLLAPSED_STORAGE_KEY, THEME_STORAGE_KEY } from "./presentationStorageKeys.ts";
+import {
+  FLEET_VIEW_STORAGE_KEY,
+  SIDEBAR_COLLAPSED_STORAGE_KEY,
+  THEME_STORAGE_KEY,
+} from "./presentationStorageKeys.ts";
 
 export type StorageDataCategory = "chain-derived" | "user-entered" | "presentation-only";
 
@@ -106,7 +109,7 @@ export const STORAGE_INVENTORY: readonly StorageInventoryEntry[] = [
   {
     key: `${SCOPED_STORAGE_PREFIX}.{base}.{network}.{guard}`,
     area: "localStorage",
-    purpose: `Per-guard drafts and filters (${SCOPED_STORAGE_BASES.join(", ")})`,
+    purpose: `Per-guard drafts, filters and event marks (${SCOPED_STORAGE_BASES.join(", ")})`,
     category: "user-entered",
     containsPublicMetadata: true,
   },
@@ -160,3 +163,27 @@ export const STORAGE_INVENTORY: readonly StorageInventoryEntry[] = [
     containsPublicMetadata: false,
   },
 ];
+
+/**
+ * The inventory's own wording for a concrete key.
+ *
+ * One table, one set of words: wherever the console names a stored key — the
+ * privacy panel, and the reset preview that appears before a destructive button
+ * (issue #529) — it reads them from here, so the disclosure and the promise made
+ * at the point of no return cannot describe the same key two ways.
+ *
+ * Templated rows (`…instances.v2.{network}`) cover every concrete key the
+ * registry reset walks, so the lookup splits on the placeholder rather than
+ * requiring an exact match. A key the inventory has never heard of is returned
+ * raw: an undiscovered preference still has to appear in the preview, just less
+ * kindly — and the test that every resettable key is disclosed fails first.
+ */
+export function describeStorageKey(key: string): string {
+  const exact = STORAGE_INVENTORY.find((entry) => entry.key === key);
+  if (exact) return exact.purpose;
+  const pattern = STORAGE_INVENTORY.find((entry) => {
+    const literal = entry.key.split(".{")[0];
+    return entry.key !== literal && key.startsWith(literal ?? "");
+  });
+  return pattern?.purpose ?? key;
+}

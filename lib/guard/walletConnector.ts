@@ -178,7 +178,7 @@ export class WalletNotInstalledError extends WalletError {
   }
 }
 
-/** The operator cancelled, or refused the permission prompt. */
+/** The operator cancelled or declined the permission prompt locally. */
 export class WalletUserRejectedError extends WalletError {
   readonly provider: WalletProviderId;
 
@@ -188,6 +188,28 @@ export class WalletUserRejectedError extends WalletError {
     );
     this.name = "WalletUserRejectedError";
     this.provider = provider;
+  }
+}
+
+/**
+ * The wallet provider or its policy refused the request independently of a simple local user cancellation.
+ * E.g. authorization refused, policy denied, security block, forbidden action.
+ */
+export class WalletRefusedError extends WalletError {
+  readonly provider: WalletProviderId;
+  readonly reason?: string | undefined;
+
+  constructor(provider: WalletProviderId, action: string, reason?: string) {
+    super(
+      `${walletProviderDescriptor(provider).name} refused to ${action}${
+        reason ? `: ${reason}` : ". The request was rejected by the provider or policy."
+      }`,
+    );
+    this.name = "WalletRefusedError";
+    this.provider = provider;
+    if (reason !== undefined) {
+      this.reason = reason;
+    }
   }
 }
 
@@ -209,15 +231,14 @@ function descriptorFor(id: WalletProviderId): WalletProviderDescriptor {
 }
 
 /**
- * Collapse a provider's failure onto one of the three outcomes the UI can act
+ * Collapse a provider's failure onto one of the distinct outcomes the UI can act
  * on.
  *
- * Each wallet reports a refusal differently — Freighter through an `error`
- * field, xBull and Albedo by throwing strings that vary by build — so the
- * matching is deliberately loose and errs towards `WalletUserRejectedError`
- * only when the wording really does say so. Anything unrecognised keeps its
- * original message: a signing error the operator cannot read is worse than one
- * that names the wallet.
+ * Distinguishes:
+ *   - WalletNotInstalledError: provider missing
+ *   - WalletUserRejectedError: operator cancelled/aborted locally
+ *   - WalletRefusedError: provider or policy refused the request
+ *   - WalletError: unknown errors kept explicit with original message
  */
 export function mapConnectorError(
   error: unknown,
@@ -235,8 +256,13 @@ export function mapConnectorError(
   ) {
     return new WalletNotInstalledError(provider, message);
   }
-  if (/reject|denied|declin|cancel|abort|user.*(close|dismiss)/.test(normalised)) {
+  // User cancellation: explicit local decline or cancellation by the operator
+  if (/user.*(reject|cancel|abort|close|dismiss|decline)|cancel|abort/.test(normalised)) {
     return new WalletUserRejectedError(provider, action);
+  }
+  // Refusal: provider-level or policy-level rejection, distinct from user cancellation
+  if (/refus|denied|unauthori|forbidden|policy violation|not permitted/.test(normalised)) {
+    return new WalletRefusedError(provider, action, message);
   }
   return new WalletError(
     `${walletProviderDescriptor(provider).name} could not ${action}: ${message}`,

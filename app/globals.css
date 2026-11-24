@@ -80,6 +80,66 @@ header.configure-header h2 {
   white-space: nowrap;
 }
 
+.configure-network-context-interactive {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.network-roles-explanation {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  background: var(--surface-2, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 6px);
+  padding: 8px 12px;
+}
+
+.role-card {
+  line-height: 1.4;
+}
+
+.role-title {
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+.role-desc {
+  color: var(--muted);
+}
+
+.endpoint-probe-section {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.probe-result {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.write-network-confirm-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 10px;
+  background: var(--warn-surface, rgba(255, 170, 0, 0.08));
+  border: 1px solid var(--warn, #e6a700);
+  border-radius: var(--radius, 6px);
+}
+
+.confirm-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .brand {
   display: flex;
   align-items: baseline;
@@ -95,6 +155,135 @@ header.configure-header h2 {
 .brand span {
   color: var(--muted);
   font-size: 12px;
+}
+
+/*
+ * The per-panel refresh strip (#528). A third flex child of `header.top` that
+ * claims a whole line of its own, so it reads as a caption to the console below
+ * rather than competing with the brand and the network pill.
+ *
+ * The wrapper exists to hold that line in the *served* markup, before any panel
+ * has mounted a poller to describe. Its rows can only appear after hydration, so
+ * a wrapper that sized itself to them would grow the header and push every panel
+ * down the page - a shift charged to the largest block on the screen. One line
+ * high, whatever lands in it: the header is the same height before the rows as
+ * after, at any viewport width, and it does not depend on how wide the panel
+ * names happen to render in this platform's font.
+ *
+ * The line therefore does not wrap. When the panels outnumber the width - three
+ * rows on a phone, or three on `/fleet` at a desktop width - the strip scrolls
+ * sideways instead of growing, and the row it cannot show is still one flick away
+ * and still in the tab order. The scrollbar is suppressed because a classic bar
+ * would cost more of a 25px line than the line can spare.
+ */
+.refresh-strip {
+  --refresh-line-h: 25px;
+  flex-basis: 100%;
+  min-height: var(--refresh-line-h);
+  display: flex;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+
+.refresh-strip::-webkit-scrollbar {
+  display: none;
+}
+
+.refresh-status {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0 18px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 11.5px;
+}
+
+.refresh-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.refresh-row > a {
+  color: var(--muted);
+  font-weight: 600;
+  text-decoration: underline;
+  text-decoration-color: var(--line);
+  text-underline-offset: 2px;
+}
+
+.refresh-row > a:hover,
+.refresh-row > a:focus-visible {
+  color: var(--text);
+  text-decoration-color: var(--text);
+}
+
+/*
+ * Cadence and freshness qualify the phase pill rather than stating anything on
+ * their own, so they stay in the quiet colour. `tabular-nums` matters: the
+ * freshness stamp changes every five seconds and must not reflow the row.
+ */
+.refresh-cadence,
+.refresh-freshness {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.refresh-detail {
+  color: var(--text);
+}
+
+@media (prefers-contrast: more) {
+  .refresh-cadence,
+  .refresh-freshness {
+    color: var(--text);
+  }
+}
+
+/*
+ * The incident panel's action rows (#527).
+ *
+ * A row stacks its heading (name plus the control that reaches the write) above
+ * the sentences that qualify it, in the order an operator decides: what, where,
+ * what it requires. Rows are divided by a border rather than by background
+ * tints, because a tint is the first thing a forced-colour mode throws away and
+ * the division is what keeps "offered" from reading as "not offered".
+ */
+.incident-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.incident-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.incident-row:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.incident-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 nav.tabs {
@@ -501,6 +690,116 @@ table.events tbody tr.severity-diagnostic td:first-child {
 
 /* Allowed and lifecycle rows are deliberately unmarked: the eye should go to the
  * blocks, and an unmarked row is what "nothing happened here" looks like. */
+
+/*
+ * Policy diff rows (issue #535).
+ *
+ * The status of a row reaches the operator three ways — the glyph, the word and
+ * the inset marker — and the colour of all three comes from the same tiers the
+ * feed rows and the status pills use. Nothing here is a raw hex: `components/
+ * PolicyDiffModal.tsx` carries no palette, so this is the only place contrast can
+ * be tuned, and `tests/unit/policyDiffLabels.test.ts` measures the tokens below
+ * against the surfaces they actually sit on (`.modal` paints `--panel`).
+ *
+ * `--danger` is the tightest of the four at 5.99:1 against `--panel`, so a change
+ * here has to be checked, not eyeballed: the AA floor for this size of text is
+ * 4.5:1 and the test fails the build below it.
+ */
+.diff-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.diff-table th[scope="col"] {
+  text-align: left;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  padding: 6px 10px 8px 0;
+  border-bottom: 1px solid var(--line);
+  font-weight: 600;
+}
+
+.diff-table th[scope="row"] {
+  text-align: left;
+  font-weight: 400;
+  color: var(--text);
+  padding: 8px 10px 8px 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.diff-table td {
+  padding: 8px 10px 8px 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  color: var(--text);
+}
+
+.diff-glyph {
+  display: inline-block;
+  min-width: 1em;
+  margin-right: 6px;
+  font-weight: 700;
+}
+
+.diff-status {
+  font-size: 12px;
+  color: var(--muted);
+  /* The markup carries a real space before the parenthesis so the row's text —
+   * what a screen reader speaks — reads "per_tx_cap (changed)", not the run-on
+   * concatenation inline elements produce. This gap is what remains of it. */
+  margin-left: 2px;
+}
+
+.diff-added .diff-glyph {
+  color: var(--ok);
+}
+
+.diff-removed .diff-glyph {
+  color: var(--danger);
+}
+
+.diff-modified .diff-glyph {
+  color: var(--warn);
+}
+
+.diff-unchanged .diff-glyph {
+  color: var(--muted);
+}
+
+.diff-added th[scope="row"] {
+  box-shadow: inset 3px 0 0 var(--ok);
+}
+
+.diff-removed th[scope="row"] {
+  box-shadow: inset 3px 0 0 var(--danger);
+}
+
+.diff-modified th[scope="row"] {
+  box-shadow: inset 3px 0 0 var(--warn);
+}
+
+.diff-unchanged th[scope="row"] {
+  box-shadow: inset 3px 0 0 var(--muted);
+}
+
+/*
+ * Forced-contrast mode: the word is what must survive the colour being taken
+ * away, so it stops being a quiet annotation and becomes part of the field name.
+ */
+@media (prefers-contrast: more) {
+  .diff-status {
+    color: var(--text);
+    font-weight: 700;
+  }
+
+  .diff-table th[scope="row"] {
+    border-bottom-color: var(--text);
+  }
+}
 
 table.asset-caps {
   width: 100%;

@@ -1,11 +1,20 @@
 import { scValToNative, xdr } from "@stellar/stellar-sdk";
+import {
+  explainReason,
+  isGuardReason,
+  reasonNameFromCode,
+  type GuardReason,
+} from "stellar-agent-guard-sdk";
 
 /** One contract invocation in a simulation trace, with its nested sub-calls. */
 export interface TraceNode {
   contractId: string;
   functionName: string;
   arguments: unknown[];
+  /** What the operator should read: the explanation's own `text`. */
   error?: string;
+  /** The same rejection as a value, so a caller can act on the code rather than the prose. */
+  errorExplanation?: GuardErrorExplanation;
   /** Return values and log lines emitted while this frame was on the stack. */
   events: string[];
   subCalls: TraceNode[];
@@ -16,22 +25,109 @@ export interface ParsedDiagnostic {
 }
 
 /**
- * The guard's `Error` enum, decoded to names an operator can act on. Only codes
- * the contract actually raises are listed; anything else is rendered verbatim as
- * `ContractError#<n>` rather than being guessed at.
+ * One guard rejection, as far as this console can honestly say what it is.
+ *
+ * `raw` is the numeric or symbolic code exactly as the trace carried it, and it
+ * is never dropped or rounded into a guess: contract and SDK vocabularies evolve
+ * ahead of a pinned build, and an operator investigating a refusal needs the
+ * code the chain actually emitted even when nothing here can name it.
+ *
+ * `recognized` is the honest half of that. A code outside this build's SDK
+ * vocabulary reports `reason: null, recognized: false` rather than collapsing
+ * into a name it does not have, because a wrong-looking-but-confident label is
+ * worse than an admitted gap: it sends an operator to fix the wrong thing.
  */
-const GUARD_ERROR_CODES: Record<number, string> = {
-  100: "SpendCapExceeded",
-};
+export interface GuardErrorExplanation {
+  /** The code as it arrived — number or symbol — or null when the trace carried none. */
+  raw: number | string | null;
+  /** The contract's reason symbol, when this build's SDK defines the code. */
+  reason: GuardReason | null;
+  /** False when nothing could be said about the code beyond quoting it back. */
+  recognized: boolean;
+  /** One line for the operator. Says plainly when the code is not recognized. */
+  text: string;
+}
 
-export function decodeGuardError(code: number): string {
-  return GUARD_ERROR_CODES[code] ?? `ContractError#${code}`;
+/**
+ * Explain a guard error code against the SDK's authoritative vocabulary.
+ *
+ * The SDK table (`GUARD_REASON_CODES`) mirrors the contract's `Error` enum and
+ * is the only place this console should read names from. A local table would be
+ * a second vocabulary to drift, and drift here is not cosmetic: it renames a
+ * real refusal.
+ *
+ * Accepts the numeric enum value or the snake_case symbol, because a trace can
+ * carry either — `sceContract(#n)` for a rolled-back call, a symbol for a
+ * committed decision event.
+ */
+export function explainGuardCode(code: number | string): GuardErrorExplanation {
+  if (typeof code === "number") {
+    const reason = reasonNameFromCode(code);
+    if (reason)
+      return {
+        raw: code,
+        reason,
+        recognized: true,
+        text: `${reason} (code ${code}): ${explainReason(code)}`,
+      };
+    return {
+      raw: code,
+      reason: null,
+      recognized: false,
+      text:
+        `Unrecognized guard error code ${code}: this build's SDK does not define it, ` +
+        `so no reason is inferred.`,
+    };
+  }
+  if (isGuardReason(code)) {
+    return { raw: code, reason: code, recognized: true, text: `${code}: ${explainReason(code)}` };
+  }
+  return {
+    raw: code,
+    reason: null,
+    recognized: false,
+    text:
+      `Unrecognized guard reason "${code}": it is not in this build's SDK vocabulary, ` +
+      `so no reason is inferred.`,
+  };
+}
+
+/** A host/system or auth error: quoted verbatim, never renamed into a guard reason. */
+function explainOpaqueError(kind: "SystemError" | "AuthError", raw: string): GuardErrorExplanation {
+  return {
+    raw,
+    reason: null,
+    recognized: false,
+    text: `${kind}(${raw})`,
+  };
+}
+
+/**
+ * Nothing decodable was there.
+ *
+ * This is the branch #312 exists for: a truncated or malformed diagnostic used
+ * to come back as `UnknownError`, which reads like a classification of the
+ * failure rather than an admission that the trace said nothing. A missing code
+ * is reported as missing, and is never filled in from a neighbouring field.
+ */
+function explainAbsent(): GuardErrorExplanation {
+  return {
+    raw: null,
+    reason: null,
+    recognized: false,
+    text: "No guard error code was present in this diagnostic, so no reason is inferred.",
+  };
 }
 
 type Normalized =
   | { kind: "call"; contractId: string; functionName: string; args: unknown[] }
   | { kind: "return"; value: unknown }
-  | { kind: "error"; error: string; contractId?: string; functionName?: string }
+  | {
+      kind: "error";
+      explanation: GuardErrorExplanation;
+      contractId?: string;
+      functionName?: string;
+    }
   | { kind: "log"; message: string; contractId?: string; functionName?: string };
 
 /** `scValToNative` on a non-ScVal is a programming error, not a trace failure. */
@@ -56,24 +152,28 @@ function render(value: unknown): string {
 }
 
 /** Decode a `Error(Contract, #N)` / `Error(Auth, …)` topic, falling back to text. */
-function describeError(errorScVal: unknown, message: unknown): string {
+function describeError(errorScVal: unknown, message: unknown): GuardErrorExplanation {
   const decoded = native(errorScVal) as
     { type?: string; code?: number; value?: string } | undefined;
   if (decoded && typeof decoded === "object") {
     if (decoded.type === "contract" && typeof decoded.code === "number") {
-      return decodeGuardError(decoded.code);
+      return explainGuardCode(decoded.code);
     }
     if (decoded.type === "system") {
-      return `SystemError(${decoded.value ?? decoded.code ?? "unknown"})`;
+      // Quoted, not explained: a host error is the Soroban VM speaking, and the
+      // guard's reason vocabulary does not cover it.
+      const raw = decoded.value ?? decoded.code;
+      if (raw === undefined) return explainAbsent();
+      return explainOpaqueError("SystemError", String(raw));
     }
   }
 
   const text = typeof message === "string" ? message : message === undefined ? "" : String(message);
   const contract = /Error\(Contract,\s*#(\d+)\)/.exec(text);
-  if (contract?.[1]) return decodeGuardError(Number(contract[1]));
+  if (contract?.[1]) return explainGuardCode(Number(contract[1]));
   const auth = /Error\(Auth,\s*(\w+)\)/.exec(text);
-  if (auth?.[1]) return `AuthError(${auth[1]})`;
-  return "UnknownError";
+  if (auth?.[1]) return explainOpaqueError("AuthError", auth[1]);
+  return explainAbsent();
 }
 
 /** Turn a decoded `ContractEvent` into a normalized trace step. */
@@ -110,7 +210,7 @@ function normalizeContractEvent(event: unknown): Normalized | null {
     return { kind: "return", value: native(data) };
   }
   if (head === "error") {
-    return { kind: "error", error: describeError(topics[1], native(data)) };
+    return { kind: "error", explanation: describeError(topics[1], native(data)) };
   }
   if (head === "log") {
     return { kind: "log", message: String(native(data) ?? "") };
@@ -126,9 +226,13 @@ function normalize(event: unknown): Normalized | null {
     } catch {
       // Not XDR: the host renders errors as plain text in some responses.
       const contract = /Error\(Contract,\s*#(\d+)\)/.exec(event);
-      if (contract?.[1]) return { kind: "error", error: decodeGuardError(Number(contract[1])) };
+      if (contract?.[1]) {
+        return { kind: "error", explanation: explainGuardCode(Number(contract[1])) };
+      }
       const auth = /Error\(Auth,\s*(\w+)\)/.exec(event);
-      if (auth?.[1]) return { kind: "error", error: `AuthError(${auth[1]})` };
+      if (auth?.[1]) {
+        return { kind: "error", explanation: explainOpaqueError("AuthError", auth[1]) };
+      }
       return { kind: "log", message: event };
     }
   }
@@ -162,28 +266,23 @@ function normalize(event: unknown): Normalized | null {
     return { kind: "return", value: record.value };
   }
   if (kind === "error" || kind === "diagnostic") {
+    const context = {
+      ...(contractId !== undefined && { contractId }),
+      ...(functionName !== undefined && { functionName }),
+    };
     const code = record.error;
     if (typeof code === "number") {
-      return {
-        kind: "error",
-        error: decodeGuardError(code),
-        ...(contractId !== undefined && { contractId }),
-        ...(functionName !== undefined && { functionName }),
-      };
+      return { kind: "error", explanation: explainGuardCode(code), ...context };
     }
     if (typeof code === "string") {
-      return {
-        kind: "error",
-        error: code,
-        ...(contractId !== undefined && { contractId }),
-        ...(functionName !== undefined && { functionName }),
-      };
+      // A symbolic code is checked against the vocabulary rather than trusted:
+      // an unrecognized symbol is quoted, and `explainGuardCode` says so.
+      return { kind: "error", explanation: explainGuardCode(code), ...context };
     }
     return {
       kind: "error",
-      error: describeError(record.errorScVal, record.message ?? record.data),
-      ...(contractId !== undefined && { contractId }),
-      ...(functionName !== undefined && { functionName }),
+      explanation: describeError(record.errorScVal, record.message ?? record.data),
+      ...context,
     };
   }
   if (kind === "log") {
@@ -248,7 +347,8 @@ export function parseDiagnosticLogs(events: unknown[]): ParsedDiagnostic {
       }
     } else if (step.kind === "error") {
       const frame = stack[stack.length - 1] ?? syntheticNode(step);
-      frame.error = step.error;
+      frame.error = step.explanation.text;
+      frame.errorExplanation = step.explanation;
     } else {
       const frame = stack[stack.length - 1] ?? syntheticNode(step);
       frame.events.push(step.message);

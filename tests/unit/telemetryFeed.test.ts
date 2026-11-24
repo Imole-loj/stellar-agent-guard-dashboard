@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { before, describe, test } from "node:test";
+import { before, beforeEach, describe, test } from "node:test";
 import type { ReactElement } from "react";
 import { GUARD_EVENT_TOPICS } from "stellar-agent-guard-sdk";
 import type { GuardEvent } from "stellar-agent-guard-sdk";
@@ -8,6 +8,8 @@ import { withIdentity } from "../mocks/eventFixtures.ts";
 import { TelemetryFeed } from "../../components/TelemetryFeed.tsx";
 import { GuardContext, GuardEventsContext } from "../../components/GuardProvider.tsx";
 import { POLL_OFF, pollHealth } from "../../lib/guard/feedHealth.ts";
+import { clearAnnouncements, pendingAnnouncements } from "../../lib/guard/useAnnounce.ts";
+import { EVENT_NOTE_MAX_LENGTH, eventMarks } from "../../lib/guard/eventMarks.ts";
 
 installDom();
 
@@ -632,4 +634,353 @@ test("each affected guard gets its own notice, and a feed with none shows none",
   } finally {
     await none.unmount();
   }
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Issues #482 and #483 — the operator's bookmark and private note on a row.
+ *
+ * The store's semantics are unit-tested in `eventMarks.test.ts`; these cases pin
+ * what the *screen* does: that the affordance is on the row, that the browser-local
+ * wording is visible rather only spoken, that the "Bookmarked only" view narrows the
+ * table, and that a refused note keeps its draft where the operator can act on it.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A value-shaped-as-a-secret note, for the one content the console refuses to store. */
+const SECRET_SEED = `S${"A".repeat(55)}`;
+
+function buttonsIn(row: Element): HTMLButtonElement[] {
+  return Array.from(row.querySelectorAll<HTMLButtonElement>("button"));
+}
+
+function buttonLabeled(container: Element, ...labels: string[]): HTMLButtonElement {
+  const wanted = new Set(labels);
+  const found = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) =>
+    wanted.has(button.textContent?.trim() ?? ""),
+  );
+  assert.ok(found, `a "${labels[0]}" control must be rendered`);
+  return found;
+}
+
+async function click(element: Element): Promise<void> {
+  await act(async () => {
+    (element as HTMLButtonElement).click();
+    await sleep(0);
+  });
+}
+
+/** Type into a controlled field the way a browser does, so React sees the change. */
+async function typeInto(textarea: HTMLTextAreaElement, value: string): Promise<void> {
+  const setter = Object.getOwnPropertyDescriptor(
+    window.HTMLTextAreaElement.prototype,
+    "value",
+  )?.set;
+  await act(async () => {
+    setter?.call(textarea, value);
+    textarea.dispatchEvent(new window.Event("input", { bubbles: true }));
+    await sleep(0);
+  });
+}
+
+function marksPanel(container: HTMLElement): Element | null {
+  return container.querySelector('[data-testid="marks-panel"]');
+}
+
+function indicators(container: HTMLElement): Element[] {
+  return Array.from(container.querySelectorAll('[data-testid="mark-indicator"]'));
+}
+
+function lastSpoken() {
+  return pendingAnnouncements()[pendingAnnouncements().length - 1] ?? null;
+}
+
+describe("operator marks on the feed (#482, #483)", () => {
+  beforeEach(async () => {
+    // The store is a singleton over real `window.localStorage`, so a mark saved by
+    // one case would otherwise be on screen in the next.
+    eventMarks.resetForTesting();
+    window.localStorage.clear();
+    clearAnnouncements();
+  });
+
+  test("a bookmark marks one row, says whose it is, and persists by event id", async () => {
+    const rendered = await renderFeed();
+    try {
+      const body = rows(rendered.container);
+      assert.equal(body.length, 2);
+      const first = body[0]!;
+      assert.equal(first.getAttribute("data-stream"), "ledger");
+      const bookmark = buttonLabeled(first, "Bookmark");
+      assert.equal(bookmark.getAttribute("aria-pressed"), "false");
+      assert.equal(indicators(rendered.container).length, 0);
+      assert.notOk(marksPanel(rendered.container), "no marks, so no panel to explain them");
+
+      await click(bookmark);
+
+      const row = rows(rendered.container)[0]!;
+      assert.equal(buttonLabeled(row, "Bookmarked").getAttribute("aria-pressed"), "true");
+      assert.equal(
+        buttonLabeled(rows(rendered.container)[1]!, "Bookmark").getAttribute("aria-pressed"),
+        "false",
+        "the sibling row is untouched",
+      );
+
+      // The visible indicator is the point: #483's failure mode is a note being read
+      // back as something the guard or the agent said.
+      const indicator = indicators(rendered.container)[0]!;
+      assert.dom(indicator).containsText("browser-local");
+      assert.dom(indicator).containsText("bookmarked");
+
+      const panel = marksPanel(rendered.container);
+      assert.ok(panel, "a saved mark earns its own explanation");
+      assert.dom(panel).containsText("1 operator mark saved in this browser");
+
+      const spoken = lastSpoken();
+      assert.equal(spoken?.message, "Bookmarked in this browser");
+      assert.equal(spoken?.priority, "polite");
+      const stored = window.localStorage.getItem(eventMarks.storageKeyFor(GUARD_A));
+      assert.ok(stored !== null, "the mark is in this browser's storage");
+      assert.match(stored!, /"bookmarked":true/);
+    } finally {
+      await rendered.unmount();
+    }
+  });
+
+  test("un-marking takes the row, the panel and the wording back", async () => {
+    const rendered = await renderFeed();
+    try {
+      const bookmark = buttonLabeled(rows(rendered.container)[0]!, "Bookmark");
+      await click(bookmark);
+      assert.equal(indicators(rendered.container).length, 1);
+
+      await click(buttonLabeled(rows(rendered.container)[0]!, "Bookmarked"));
+
+      assert.equal(indicators(rendered.container).length, 0);
+      assert.notOk(marksPanel(rendered.container), "the panel goes with the last mark");
+      assert.equal(window.localStorage.getItem(eventMarks.storageKeyFor(GUARD_A)), null);
+      assert.equal(lastSpoken()?.message, "Bookmark removed");
+    } finally {
+      await rendered.unmount();
+    }
+  });
+
+  test("a bookmarked diagnostic says there is no ledger to re-read it from", async () => {
+    const rendered = await renderFeed();
+    try {
+      // Row two is the refusal: `diag:`-hashed identity, no transaction behind it.
+      const refusal = rows(rendered.container)[1]!;
+      assert.equal(refusal.getAttribute("data-stream"), "diagnostic");
+      await click(buttonLabeled(refusal, "Bookmark"));
+
+      assert.equal(
+        lastSpoken()?.message,
+        "Bookmarked in this browser; this row has no ledger to re-read it from",
+      );
+      assert.equal(
+        window.localStorage.getItem(eventMarks.storageKeyFor(GUARD_B)) !== null,
+        true,
+        "the mark is scoped to the guard that emitted the refusal",
+      );
+    } finally {
+      await rendered.unmount();
+    }
+  });
+
+  test("a row the feed cannot identify offers no control and says why", async () => {
+    const unaddressable = { ...event(GUARD_A, 300, false), contractId: null };
+    const rendered = await renderFeed({}, {}, [unaddressable]);
+    try {
+      const row = rows(rendered.container)[0]!;
+      assert.equal(
+        buttonsIn(row).some((button) => /Bookmark|^Note$/.test(button.textContent ?? "")),
+        false,
+      );
+      const notice = row.querySelector('[data-testid="mark-unavailable"]');
+      assert.ok(notice, "the reason is on screen, not only in the announcement queue");
+      assert.dom(notice).containsText("nothing to save a mark against");
+      assert.equal(
+        window.localStorage.getItem(eventMarks.storageKeyFor(GUARD_A)),
+        null,
+        "and no mark was written for a row that cannot be identified",
+      );
+    } finally {
+      await rendered.unmount();
+    }
+  });
+
+  test("a note saves against the row's identity and reads back on the row", async () => {
+    const rendered = await renderFeed();
+    try {
+      const row = rows(rendered.container)[0]!;
+      await click(buttonLabeled(row, "Note"));
+      const textarea = rendered.container.querySelector("textarea");
+      assert.ok(textarea, "the editor opens in the row");
+      assert.match(
+        textarea.getAttribute("aria-label") ?? "",
+        /stored in this browser only/,
+        "the field itself says where the text will live",
+      );
+      assert.dom(textarea.parentElement!).containsText(`0/${EVENT_NOTE_MAX_LENGTH} characters`);
+
+      const noteText = "correlate with the 12:00 deploy";
+      await typeInto(textarea, noteText);
+      assert
+        .dom(textarea.parentElement!)
+        .containsText(`${noteText.length}/${EVENT_NOTE_MAX_LENGTH} characters`);
+      await click(buttonLabeled(rendered.container, "Save note"));
+
+      const marked = rows(rendered.container)[0]!;
+      assert.notOk(marked.querySelector("textarea"), "saving closes the editor");
+      assert.dom(indicators(marked)[0]!).containsText(noteText);
+      assert.equal(lastSpoken()?.message, "Note saved in this browser");
+      assert.equal(buttonLabeled(marked, "Edit note").textContent?.trim(), "Edit note");
+    } finally {
+      await rendered.unmount();
+    }
+  });
+
+  test("a note holding a secret key is refused inline, with the draft kept", async () => {
+    const rendered = await renderFeed();
+    try {
+      const row = rows(rendered.container)[0]!;
+      await click(buttonLabeled(row, "Note"));
+      const textarea = rendered.container.querySelector("textarea")!;
+      await typeInto(textarea, `key: ${SECRET_SEED}`);
+      await click(buttonLabeled(rendered.container, "Save note"));
+
+      const error = rendered.container.querySelector('[data-testid="note-error"]');
+      assert.ok(error, "the refusal is stated on the row");
+      assert.equal(error.getAttribute("role"), "alert");
+      assert.dom(error).containsText("secret key");
+      // A boolean rather than `doesNotContainText`: that helper quotes the needle in
+      // its failure message, and the needle here is the key-shaped string.
+      assert.ok(
+        !(error.textContent ?? "").includes(SECRET_SEED),
+        "the refusal names the problem without echoing the text back",
+      );
+      assert.equal(
+        rendered.container.querySelector("textarea")?.value,
+        `key: ${SECRET_SEED}`,
+        "the editor stays open so the operator can fix the text rather than lose it",
+      );
+      assert.equal(indicators(rendered.container).length, 0);
+      assert.equal(window.localStorage.getItem(eventMarks.storageKeyFor(GUARD_A)), null);
+      assert.equal(lastSpoken()?.priority, "assertive");
+      assert.match(lastSpoken()?.message ?? "", /^Note was not saved: /);
+    } finally {
+      await rendered.unmount();
+    }
+  });
+
+  test("cancelling a note writes nothing, and an empty save on a bare row stays silent", async () => {
+    const rendered = await renderFeed();
+    try {
+      const row = rows(rendered.container)[0]!;
+      await click(buttonLabeled(row, "Note"));
+      await typeInto(rendered.container.querySelector("textarea")!, "abandoned thought");
+      await click(buttonLabeled(rendered.container, "Cancel"));
+
+      assert.notOk(rendered.container.querySelector("textarea"), "cancel closes the editor");
+      assert.equal(indicators(rendered.container).length, 0);
+      assert.equal(window.localStorage.getItem(eventMarks.storageKeyFor(GUARD_A)), null);
+
+      // An empty note on a row that holds nothing removes nothing, so the console
+      // says nothing rather than announcing a removal that did not happen.
+      await click(buttonLabeled(rows(rendered.container)[0]!, "Note"));
+      await click(buttonLabeled(rendered.container, "Save note"));
+      assert.deepEqual(pendingAnnouncements(), []);
+      assert.equal(lastSpoken(), null);
+    } finally {
+      await rendered.unmount();
+    }
+  });
+
+  test("the bookmarked-only view narrows the table to what the operator saved", async () => {
+    const rendered = await renderFeed();
+    try {
+      await click(buttonLabeled(rows(rendered.container)[0]!, "Bookmark"));
+      const panel = marksPanel(rendered.container);
+      assert.ok(panel);
+      assert.dom(panel).containsText("(1 in view)");
+      const checkbox = panel.querySelector('input[type="checkbox"]') as HTMLInputElement;
+      assert.ok(checkbox);
+
+      await click(checkbox);
+      const shown = rows(rendered.container);
+      assert.equal(shown.length, 1, "only the bookmarked row is in view");
+      assert.equal(shown[0]?.getAttribute("data-stream"), "ledger");
+      assert.equal(checkbox.checked, true);
+      assert.equal(indicators(rendered.container).length, 1);
+
+      // Both rows bookmarked: the view holds both, and the count moved with them.
+      await click(checkbox);
+      await click(buttonLabeled(rows(rendered.container)[1]!, "Bookmark"));
+      await click(checkbox);
+      assert.equal(rows(rendered.container).length, 2);
+      assert.dom(marksPanel(rendered.container)).containsText("2 operator marks saved");
+    } finally {
+      await rendered.unmount();
+    }
+  });
+
+  test("clearing the filters clears the bookmark view too", async () => {
+    const rendered = await renderFeed();
+    try {
+      await click(buttonLabeled(rows(rendered.container)[0]!, "Bookmark"));
+      const checkbox = marksPanel(rendered.container)!.querySelector('input[type="checkbox"]')!;
+      await click(checkbox);
+      assert.equal(rows(rendered.container).length, 1);
+
+      await click(buttonLabeled(rendered.container, "Clear filters"));
+
+      assert.equal(rows(rendered.container).length, 2);
+      assert.equal(
+        (
+          marksPanel(rendered.container)!.querySelector(
+            'input[type="checkbox"]',
+          ) as HTMLInputElement
+        ).checked,
+        false,
+        "the bookmark view is a filter, so clearing filters clears it",
+      );
+      assert.equal(
+        indicators(rendered.container).length,
+        1,
+        "clearing the view never deletes the mark",
+      );
+    } finally {
+      await rendered.unmount();
+    }
+  });
+
+  test("a mark adds no live region of its own to the feed", async () => {
+    const rendered = await renderFeed();
+    try {
+      // The chart ships its own keyboard readout, so the claim is about what marking
+      // a row *adds* — a new live region would interrupt the operator mid-sentence
+      // and duplicate what the announcer already says.
+      const liveBefore = Array.from(rendered.container.querySelectorAll("[aria-live]"));
+      await click(buttonLabeled(rows(rendered.container)[0]!, "Bookmark"));
+      const liveAfter = Array.from(rendered.container.querySelectorAll("[aria-live]"));
+
+      assert.equal(liveAfter.length, liveBefore.length, "marking a row added no live region");
+      // A boolean, not the node: `assert.equal(element, null)` on a failure asks
+      // Node to inspect a jsdom subtree and the report never comes back.
+      assert.ok(
+        liveAfter.every(
+          (region) =>
+            region.closest('[data-testid="marks-panel"], [data-testid="mark-indicator"]') === null,
+        ),
+        "and none of the regions on screen belongs to the mark UI",
+      );
+      assert.equal(
+        pendingAnnouncements().length,
+        1,
+        "the operator's words left through the announce queue, the only channel",
+      );
+    } finally {
+      await rendered.unmount();
+    }
+  });
 });

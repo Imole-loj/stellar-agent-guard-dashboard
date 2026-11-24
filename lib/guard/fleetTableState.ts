@@ -28,7 +28,13 @@ import {
   type SortDirection,
   type SortKey,
 } from "./fleet.ts";
+import { FLEET_VIEW_STORAGE_KEY } from "./presentationStorageKeys.ts";
 import type { StorageLike } from "./instance.ts";
+
+// Defined beside the other presentation keys so `lib/guard/storage.ts` can list
+// it without importing this module — which would close an import cycle. Re-exported
+// as part of this module's surface, since this is the code the key belongs to.
+export { FLEET_VIEW_STORAGE_KEY };
 
 export type FleetTableState =
   { kind: "loading" } | { kind: "registry-empty" } | { kind: "filter-empty" } | { kind: "rows" };
@@ -77,9 +83,6 @@ export function fleetEmptyCopy(state: FleetTableState): { title: string; hint: s
 // next poll decides what each row is, and a remembered "Frozen" filter simply
 // selects whichever rows read as frozen *now*.
 
-/** Storage key for the remembered view. Versioned so a shape change cannot be misread. */
-export const FLEET_VIEW_STORAGE_KEY = "stellar-agent-guard-dashboard.fleet-view.v1";
-
 /** Cap on remembered search text, so a pasted blob cannot bloat storage. */
 export const FLEET_SEARCH_MAX_LENGTH = 200;
 
@@ -87,6 +90,7 @@ export interface FleetViewState {
   search: string;
   network: string | null;
   status: DerivedStatus | null;
+  tag?: string | null | undefined;
   /** `null` is the default order: the registry's own. */
   sortKey: SortKey | null;
   sortDirection: SortDirection;
@@ -96,6 +100,7 @@ export const DEFAULT_FLEET_VIEW: FleetViewState = {
   search: "",
   network: null,
   status: null,
+  tag: null,
   sortKey: null,
   sortDirection: "asc",
 };
@@ -106,13 +111,22 @@ export const FLEET_STATUSES: readonly DerivedStatus[] = ["Active", "Frozen", "Ex
 /** True when the view would show every row in registry order. */
 export function isDefaultFleetView(view: FleetViewState): boolean {
   return (
-    view.search === "" && view.network === null && view.status === null && view.sortKey === null
+    view.search === "" &&
+    view.network === null &&
+    view.status === null &&
+    (view.tag === null || view.tag === undefined || view.tag === "") &&
+    view.sortKey === null
   );
 }
 
 /** True when search or a filter (not just the sort) is narrowing the rows. */
 export function hasActiveFleetFilter(view: FleetViewState): boolean {
-  return view.search.trim() !== "" || view.network !== null || view.status !== null;
+  return (
+    view.search.trim() !== "" ||
+    view.network !== null ||
+    view.status !== null ||
+    (view.tag !== null && view.tag !== undefined && view.tag !== "")
+  );
 }
 
 /**
@@ -133,6 +147,7 @@ export function parseFleetView(raw: unknown, networks: readonly string[] = []): 
   const network =
     typeof input.network === "string" && networks.includes(input.network) ? input.network : null;
   const status = FLEET_STATUSES.find((candidate) => candidate === input.status) ?? null;
+  const tag = typeof input.tag === "string" && input.tag.trim() ? input.tag.trim() : null;
   const sortKey = SORT_KEYS.find((candidate) => candidate === input.sortKey) ?? null;
   const sortDirection: SortDirection =
     input.sortDirection === "asc" || input.sortDirection === "desc"
@@ -141,7 +156,7 @@ export function parseFleetView(raw: unknown, networks: readonly string[] = []): 
         ? defaultSortDirection(sortKey)
         : "asc";
 
-  return { search, network, status, sortKey, sortDirection };
+  return { search, network, status, tag, sortKey, sortDirection };
 }
 
 function defaultStorage(): StorageLike | null {
@@ -282,8 +297,102 @@ export function createFleetViewStore(options?: {
  */
 export function applyFleetView(rows: FleetRow[], view: FleetViewState): FleetRow[] {
   return sortFleet(
-    filterFleet(rows, view.search, view.network, view.status),
+    filterFleet(rows, view.search, view.network, view.status, view.tag),
     view.sortKey,
     view.sortDirection,
   );
+}
+
+// ── Operator Column Layout Preferences (Issue #476) ──────────────────────────
+
+export type FleetColumnId =
+  "selection" | "guard" | "network" | "status" | "policyAge" | "tags" | "spend" | "dms" | "actions";
+
+export interface FleetColumnConfig {
+  id: FleetColumnId;
+  label: string;
+  visible: boolean;
+  canHide: boolean;
+}
+
+export const DEFAULT_FLEET_COLUMNS: FleetColumnConfig[] = [
+  { id: "selection", label: "Select", visible: true, canHide: false },
+  { id: "guard", label: "Guard", visible: true, canHide: false },
+  { id: "network", label: "Network", visible: true, canHide: true },
+  { id: "status", label: "Status", visible: true, canHide: true },
+  { id: "policyAge", label: "Policy Age", visible: true, canHide: true },
+  { id: "tags", label: "Tags", visible: true, canHide: true },
+  { id: "spend", label: "24h Spend", visible: true, canHide: true },
+  { id: "dms", label: "DMS Countdown", visible: true, canHide: true },
+  { id: "actions", label: "Actions", visible: true, canHide: true },
+];
+
+export const FLEET_COLUMNS_STORAGE_KEY = "stellar-agent-guard-dashboard.fleet-columns.v1";
+
+/**
+ * Read the operator's saved column layout preferences.
+ * Only presentation choices (visibility, ordering) are loaded; no chain state is touched.
+ */
+export function loadFleetColumns(storage?: StorageLike | null): FleetColumnConfig[] {
+  const store = storage === undefined ? defaultStorage() : storage;
+  if (!store) return DEFAULT_FLEET_COLUMNS;
+  try {
+    const raw = store.getItem(FLEET_COLUMNS_STORAGE_KEY);
+    if (!raw) return DEFAULT_FLEET_COLUMNS;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return DEFAULT_FLEET_COLUMNS;
+
+    const result: FleetColumnConfig[] = [];
+    const seen = new Set<string>();
+
+    for (const item of parsed) {
+      if (typeof item !== "object" || item === null) continue;
+      const id = (item as { id?: unknown }).id as FleetColumnId;
+      const def = DEFAULT_FLEET_COLUMNS.find((c) => c.id === id);
+      if (!def || seen.has(id)) continue;
+      seen.add(id);
+
+      const visible = def.canHide ? (item as { visible?: unknown }).visible !== false : true;
+      result.push({ ...def, visible });
+    }
+
+    for (const def of DEFAULT_FLEET_COLUMNS) {
+      if (!seen.has(def.id)) {
+        result.push({ ...def });
+      }
+    }
+
+    return result;
+  } catch {
+    return DEFAULT_FLEET_COLUMNS;
+  }
+}
+
+/**
+ * Persist presentation preferences for fleet columns.
+ * Only stores column IDs and visibility bits.
+ */
+export function saveFleetColumns(columns: FleetColumnConfig[], storage?: StorageLike | null): void {
+  const store = storage === undefined ? defaultStorage() : storage;
+  if (!store) return;
+  try {
+    const payload = columns.map((col) => ({
+      id: col.id,
+      visible: col.canHide ? col.visible : true,
+    }));
+    store.setItem(FLEET_COLUMNS_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // Best-effort presentation persistence
+  }
+}
+
+/**
+ * Reset column layout back to factory default order and visibility.
+ */
+export function resetFleetColumns(storage?: StorageLike | null): FleetColumnConfig[] {
+  const store = storage === undefined ? defaultStorage() : storage;
+  if (store && typeof store.removeItem === "function") {
+    store.removeItem(FLEET_COLUMNS_STORAGE_KEY);
+  }
+  return DEFAULT_FLEET_COLUMNS.map((c) => ({ ...c }));
 }

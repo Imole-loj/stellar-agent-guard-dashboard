@@ -15,7 +15,12 @@
  *     in `lib/guard/audioAlert.ts` and is tested there; this component just
  *     asks each new feed event whether it earns a chime.
  *   - It does not stack. `requireInteraction` plus a stable `tag` means five
- *     blocks in ten seconds are one notification, not five.
+ *     blocks in ten seconds are one notification, not five. And one block
+ *     re-polled by the feed is one alert, not one per poll (#313).
+ *   - It says what it can actually do. The switch is the operator's preference;
+ *     the browser's permission and the last delivery are two separate facts, and
+ *     the panel states all three instead of implying that an enabled switch is
+ *     a working alert (#314).
  *
  * Mounted inside the telemetry panel rather than the page, so the control sits
  * next to the feed whose events it announces.
@@ -25,19 +30,32 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GuardEvent } from "stellar-agent-guard-sdk";
 import { useGuard, useGuardEvents } from "./GuardProvider.tsx";
 import { short } from "./bits.tsx";
+import { NETWORK } from "../lib/guard/network.ts";
 import {
   AudioAlerter,
+  ALERT_DEDUPE_PERSIST_LIMIT,
+  alertDedupeScopeKey,
   alertsArmed,
   alertReasonFor,
+  audioEffective,
   buildNotificationPayload,
   createAlertTracker,
   deliverNotification,
+  desktopEffective,
+  describeAudioEffective,
+  describeDesktopEffective,
+  describeNotificationDelivery,
+  loadAlertDedupe,
   loadAlertSettings,
   notificationPermissionState,
   readBrowserNotificationApi,
   requestNotificationPermission,
+  saveAlertDedupe,
   saveAlertSettings,
+  type AlertDedupeScope,
   type AlertSettings,
+  type AudioPlayReport,
+  type NotificationDelivery,
   type NotificationPermissionState,
 } from "../lib/guard/audioAlert.ts";
 
@@ -49,7 +67,7 @@ const REASON_LABEL: Record<NonNullable<ReturnType<typeof alertReasonFor>>, strin
 
 export function TelemetryAlerts() {
   const events = useGuardEvents();
-  const { guard } = useGuard();
+  const { guard, feed } = useGuard();
   const [settings, setSettings] = useState<AlertSettings>({
     audio: false,
     desktop: false,
@@ -57,13 +75,32 @@ export function TelemetryAlerts() {
   });
   const [permission, setPermission] = useState<NotificationPermissionState>("unsupported");
   const [lastAlert, setLastAlert] = useState<string | null>(null);
+  // The two things the panel can only know by trying (#314): what the browser
+  // did with the last notification, and whether the last chime actually played.
+  const [lastDelivery, setLastDelivery] = useState<NotificationDelivery | null>(null);
+  const [lastPlay, setLastPlay] = useState<AudioPlayReport | null>(null);
 
   // One alerter and one seen-set per tab. The alerter owns the AudioContext, so
   // recreating it on a re-render would drop the unlocked state and go silent
   // again without saying so.
   const alerter = useMemo(() => AudioAlerter.forBrowser(), []);
-  const tracker = useMemo(() => createAlertTracker(), []);
   const notificationApi = useMemo(() => readBrowserNotificationApi(), []);
+
+  // The seen-set lives in a ref for the same reason: `feed.guards` is a fresh
+  // array on every poll, so a `useMemo` keyed on it would rebuild the tracker
+  // every five seconds and re-chime the block it just announced. It is replaced
+  // only when the *scope* changes, below (#313).
+  const trackerRef = useRef(createAlertTracker());
+  const scopedKeyRef = useRef<string | null>(null);
+
+  const scope = useMemo<AlertDedupeScope>(
+    () => ({
+      network: NETWORK.name,
+      guards: [guard, ...feed.guards.map((source) => source.guard)],
+    }),
+    [guard, feed.guards],
+  );
+  const scopeKey = alertDedupeScopeKey(scope);
 
   // Settings and permission are only knowable in the browser, so both settle in
   // an effect. Rendering the stored value during the first render would produce
@@ -84,10 +121,20 @@ export function TelemetryAlerts() {
     saveAlertSettings(settings);
   }, [settings]);
 
-  // Fresh, security-critical events only. `tracker` is what keeps a 5s poll from
-  // re-announcing the same block; without it a single refusal chimes once per
-  // poll until it ages out of the feed.
+  // Fresh, security-critical events only. `trackerRef` is what keeps a 5s poll
+  // from re-announcing the same block; without it a single refusal chimes once
+  // per poll until it ages out of the feed.
   useEffect(() => {
+    if (scopedKeyRef.current !== scopeKey) {
+      // A different network or a different watched guard set is a different
+      // stream of identities, so the memory is dropped and re-primed from that
+      // scope's own record: switching never replays another scope's alerts, and
+      // a reload never re-chimes this tab's history (#313).
+      scopedKeyRef.current = scopeKey;
+      trackerRef.current = createAlertTracker(ALERT_DEDUPE_PERSIST_LIMIT, loadAlertDedupe(scope));
+    }
+    const tracker = trackerRef.current;
+
     const announce = () => {
       if (!alertsArmed(settings)) return;
       const fresh = tracker.unseen(events).filter((event) => alertReasonFor(event) !== null);
@@ -96,17 +143,23 @@ export function TelemetryAlerts() {
       for (const event of fresh) {
         const reason = alertReasonFor(event);
         if (!reason) continue;
-        if (settings.audio) alerter.play();
+        if (settings.audio) setLastPlay(alerter.play());
         if (settings.desktop) {
-          deliverNotification(buildNotificationPayload(event, guard), notificationApi);
+          setLastDelivery(
+            deliverNotification(buildNotificationPayload(event, guard), notificationApi),
+          );
         }
       }
+      // The identities survive a reload only if they are written down; the
+      // write is best-effort (private mode and quota are handled in the store).
+      saveAlertDedupe(scope, tracker.keys());
+
       const newest = fresh[fresh.length - 1] as GuardEvent;
       const newestReason = alertReasonFor(newest);
       if (newestReason) setLastAlert(`${REASON_LABEL[newestReason]} · ${short(guard, 6, 4)}`);
     };
     announce();
-  }, [events, settings, tracker, alerter, guard, notificationApi]);
+  }, [events, settings, scope, scopeKey, alerter, guard, notificationApi]);
 
   /** Turn the chime on. The click is what unlocks audio, so this cannot be a checkbox. */
   const toggleAudio = useCallback(() => {
@@ -118,13 +171,17 @@ export function TelemetryAlerts() {
           setLastAlert("This browser has no Web Audio, so chimes are unavailable.");
           return { ...current, audio: false };
         }
-        alerter.play();
+        setLastPlay(alerter.play());
       }
       return next;
     });
   }, [alerter]);
 
   const toggleDesktop = useCallback(() => {
+    // A new preference is a new question, so the previous answer stops being
+    // the one on screen: an old delivery failure would otherwise read as a
+    // broken channel the operator has just re-enabled.
+    setLastDelivery(null);
     setSettings((current) => {
       const next = { ...current, desktop: !current.desktop };
       if (next.desktop) {
@@ -144,6 +201,8 @@ export function TelemetryAlerts() {
     });
   }, [notificationApi]);
 
+  const desktopState = desktopEffective(settings.desktop, permission, lastDelivery);
+  const audioState = audioEffective(settings.audio, lastPlay);
   const armed = alertsArmed(settings);
 
   return (
@@ -163,6 +222,23 @@ export function TelemetryAlerts() {
           A short chime and a desktop notification when the guard blocks a call, or when an admin
           freezes the account or revokes a policy. Off until you turn it on.
         </p>
+        <p className="tiny muted" style={{ marginTop: 4 }} data-testid="chime-alert-state">
+          {describeAudioEffective(audioState)}
+        </p>
+        <p className="tiny muted" style={{ marginTop: 4 }} data-testid="desktop-alert-state">
+          {describeDesktopEffective(desktopState)}
+        </p>
+        {lastDelivery && (
+          <p
+            className={lastDelivery.delivered ? "tiny muted" : "tiny"}
+            style={
+              lastDelivery.delivered ? { marginTop: 4 } : { marginTop: 4, color: "var(--danger)" }
+            }
+            data-testid="notification-delivery"
+          >
+            {describeNotificationDelivery(lastDelivery)}
+          </p>
+        )}
         {lastAlert && (
           <p className="tiny" style={{ marginTop: 4 }}>
             Last alert: {lastAlert}
@@ -212,9 +288,6 @@ export function TelemetryAlerts() {
             aria-label="Alert chime volume"
           />
         </label>
-        {permission === "default" && settings.desktop && (
-          <span className="tiny muted">Waiting for you to allow notifications.</span>
-        )}
       </div>
     </div>
   );

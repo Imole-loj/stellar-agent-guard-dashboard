@@ -29,12 +29,14 @@ import {
 } from "./versionedStorage.ts";
 
 /** The panels the console's grid can hold. */
-export type PanelId = "status" | "txhistory" | "panic" | "telemetry" | "multisig" | "xdr";
+export type PanelId =
+  "status" | "txhistory" | "panic" | "incident" | "telemetry" | "multisig" | "xdr";
 
 export const PANEL_IDS: readonly PanelId[] = [
   "status",
   "txhistory",
   "panic",
+  "incident",
   "telemetry",
   "multisig",
   "xdr",
@@ -45,6 +47,7 @@ export const DEFAULT_LAYOUT: readonly PanelId[] = [
   "status",
   "txhistory",
   "panic",
+  "incident",
   "telemetry",
   "multisig",
   "xdr",

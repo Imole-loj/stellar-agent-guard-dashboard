@@ -27,6 +27,9 @@ import {
   formatAsJson,
   getOperatorStorageCategories,
   clearOperatorStorageCategory,
+  previewOperatorStorageCategory,
+  PRESENTATION_STORAGE_KEYS,
+  SECURITY_PREFERENCE_STORAGE_KEYS,
   jsonTree,
   storageKeyLabel,
   summarizeEntries,
@@ -47,8 +50,16 @@ import {
 } from "../mocks/sorobanFixtures.ts";
 import { ADDRESS_BOOK_STORAGE_KEY } from "../../lib/guard/addressBook.ts";
 import { TX_HISTORY_STORAGE_KEY } from "../../lib/guard/txHistory.ts";
-import { LAYOUT_STORAGE_KEY } from "../../lib/guard/layoutStore.ts";
-import { THEME_STORAGE_KEY } from "../../lib/guard/presentationStorageKeys.ts";
+import { LAYOUT_STORAGE_KEY, NAMED_LAYOUTS_STORAGE_KEY } from "../../lib/guard/layoutStore.ts";
+import { DENSITY_STORAGE_KEY } from "../../lib/guard/densityStore.ts";
+import { PRIVACY_MASK_STORAGE_KEY } from "../../lib/guard/privacyStore.ts";
+import { IDLE_TIMEOUT_NEVER_MS, IDLE_TIMEOUT_STORAGE_KEY } from "../../lib/guard/useIdleTimer.ts";
+import { WEBHOOK_SETTINGS_STORAGE_KEY } from "../../lib/guard/webhookDispatcher.ts";
+import { describeStorageKey, STORAGE_INVENTORY } from "../../lib/guard/storageInventory.ts";
+import {
+  FLEET_VIEW_STORAGE_KEY,
+  THEME_STORAGE_KEY,
+} from "../../lib/guard/presentationStorageKeys.ts";
 import { INSTANCE_STORAGE_PREFIX, LEGACY_INSTANCE_STORAGE_KEY } from "../../lib/guard/instance.ts";
 import { SCOPED_STORAGE_PREFIX } from "../../lib/guard/guardScoped.ts";
 import { installDom, loadReact } from "./domHarness.ts";
@@ -545,8 +556,15 @@ describe("operator browser-local storage controls and category isolation (#332)"
     assert.equal(addressCat.itemCount, 1);
 
     const layoutCat = categories.find((c) => c.id === "layouts")!;
-    assert.equal(layoutCat.name, "Layouts & UI Preferences");
+    assert.equal(layoutCat.name, "Presentation preferences");
     assert.equal(layoutCat.itemCount, 2);
+    // A layout reset returns settings to a default; the other three categories
+    // delete records that have no default. One label for both was the bug.
+    assert.equal(layoutCat.actionLabel, "Reset");
+    assert.deepEqual(
+      categories.map((c) => `${c.id}:${c.actionLabel}`),
+      ["history:Clear", "address-book:Clear", "layouts:Reset", "guard-registry:Clear"],
+    );
 
     const guardCat = categories.find((c) => c.id === "guard-registry")!;
     assert.equal(guardCat.name, "Guard Registry");
@@ -590,6 +608,8 @@ describe("operator browser-local storage controls and category isolation (#332)"
     store.setItem(LAYOUT_STORAGE_KEY, "layouts");
     store.setItem(THEME_STORAGE_KEY, "dark");
     store.setItem(`${INSTANCE_STORAGE_PREFIX}.testnet`, "guards");
+    store.setItem(WEBHOOK_SETTINGS_STORAGE_KEY, "webhooks");
+    store.setItem(`${SCOPED_STORAGE_PREFIX}.policy.testnet.guard`, "draft");
 
     clearOperatorStorageCategory("layouts", store);
 
@@ -597,7 +617,47 @@ describe("operator browser-local storage controls and category isolation (#332)"
     assert.equal(store.getItem(THEME_STORAGE_KEY), null);
     assert.equal(store.getItem(TX_HISTORY_STORAGE_KEY), "history");
     assert.equal(store.getItem(ADDRESS_BOOK_STORAGE_KEY), "addressbook");
+    assert.equal(store.getItem(WEBHOOK_SETTINGS_STORAGE_KEY), "webhooks");
     assert.equal(store.getItem(`${INSTANCE_STORAGE_PREFIX}.testnet`), "guards");
+    assert.equal(
+      store.getItem(`${SCOPED_STORAGE_PREFIX}.policy.testnet.guard`),
+      "draft",
+      "a display reset must not delete a half-written policy draft",
+    );
+  });
+
+  test("a display reset takes the arrangement and not the protection (issue #529)", () => {
+    const store = makeFakeStore();
+    // The two keys the old list carried and this one must not.
+    store.setItem(IDLE_TIMEOUT_STORAGE_KEY, String(IDLE_TIMEOUT_NEVER_MS));
+    store.setItem(PRIVACY_MASK_STORAGE_KEY, "true");
+    // The two arrangement keys the old list had forgotten.
+    store.setItem(NAMED_LAYOUTS_STORAGE_KEY, JSON.stringify({ "DeFi bot": [] }));
+    store.setItem(FLEET_VIEW_STORAGE_KEY, JSON.stringify({ sort: "label" }));
+    store.setItem(DENSITY_STORAGE_KEY, "compact");
+
+    const before = getOperatorStorageCategories(store);
+    assert.equal(
+      before.find((c) => c.id === "layouts")!.itemCount,
+      3,
+      "the count covers the whole presentation set, not a subset of it",
+    );
+
+    clearOperatorStorageCategory("layouts", store);
+
+    assert.equal(store.getItem(NAMED_LAYOUTS_STORAGE_KEY), null, "named layouts are arrangement");
+    assert.equal(store.getItem(FLEET_VIEW_STORAGE_KEY), null, "the fleet view is arrangement");
+    assert.equal(store.getItem(DENSITY_STORAGE_KEY), null);
+    assert.equal(
+      store.getItem(IDLE_TIMEOUT_STORAGE_KEY),
+      String(IDLE_TIMEOUT_NEVER_MS),
+      "clearing the idle lock on the way past a layout reset is a security downgrade nobody asked for",
+    );
+    assert.equal(
+      store.getItem(PRIVACY_MASK_STORAGE_KEY),
+      "true",
+      "masking is opt-in; a reset must not opt the operator out",
+    );
   });
 
   test("category isolation: clearing guard-registry leaves other categories untouched", () => {
@@ -617,6 +677,132 @@ describe("operator browser-local storage controls and category isolation (#332)"
     assert.equal(store.getItem(TX_HISTORY_STORAGE_KEY), "history");
     assert.equal(store.getItem(ADDRESS_BOOK_STORAGE_KEY), "addressbook");
     assert.equal(store.getItem(LAYOUT_STORAGE_KEY), "layouts");
+  });
+
+  test("the reset preview names what goes and what stays, before anything goes", () => {
+    const store = makeFakeStore();
+    store.setItem(LAYOUT_STORAGE_KEY, "layouts");
+    store.setItem(DENSITY_STORAGE_KEY, "compact");
+    store.setItem(IDLE_TIMEOUT_STORAGE_KEY, String(IDLE_TIMEOUT_NEVER_MS));
+    store.setItem(`${INSTANCE_STORAGE_PREFIX}.testnet`, "guards");
+
+    const preview = previewOperatorStorageCategory("layouts", store);
+    assert.deepEqual(
+      [...preview.affectedKeys].sort(),
+      [DENSITY_STORAGE_KEY, LAYOUT_STORAGE_KEY].sort(),
+      "only the keys actually stored are previewed — THEME is absent and must not be listed",
+    );
+    assert.equal(preview.empty, false);
+    for (const note of [
+      "Saved guards and per-guard drafts",
+      "Address book contacts",
+      "Transaction history",
+      "Webhook destinations",
+    ]) {
+      assert.ok(
+        preview.untouched.includes(note),
+        `the preview has to promise ${note} survives; said: ${preview.untouched.join(", ")}`,
+      );
+    }
+    // The idle lock and value masking are excluded by key, not by a sentence
+    // somebody has to remember to edit, and this issue exists for that exclusion.
+    assert.deepEqual(
+      [...preview.untouchedKeys].sort(),
+      [...SECURITY_PREFERENCE_STORAGE_KEYS].sort(),
+      "the security preferences the old layout reset silently cleared must be named as safe",
+    );
+    assert.ok(preview.untouchedKeys.some((key) => /idle/i.test(key)));
+    assert.ok(preview.untouchedKeys.some((key) => /mask/i.test(key)));
+  });
+
+  test("a preview with nothing to remove says so instead of listing defaults", () => {
+    const preview = previewOperatorStorageCategory("layouts", makeFakeStore());
+    assert.deepEqual(preview.affectedKeys, []);
+    assert.equal(preview.empty, true);
+  });
+
+  test("the preview agrees with the reset it previews", () => {
+    // The property that matters: a listed key is a key the button removes, and a
+    // key the button removes is a listed key. Asserted for a full store, because
+    // a preview that over-promises is the failure an operator cannot undo.
+    const store = makeFakeStore();
+    for (const key of PRESENTATION_STORAGE_KEYS) store.setItem(key, "set");
+    for (const key of SECURITY_PREFERENCE_STORAGE_KEYS) store.setItem(key, "set");
+    store.setItem(TX_HISTORY_STORAGE_KEY, "history");
+    store.setItem(`${INSTANCE_STORAGE_PREFIX}.testnet`, "guards");
+
+    const preview = previewOperatorStorageCategory("layouts", store);
+    const listed = [...preview.affectedKeys].sort();
+    assert.deepEqual(listed, [...PRESENTATION_STORAGE_KEYS].sort());
+
+    clearOperatorStorageCategory("layouts", store);
+
+    for (const key of PRESENTATION_STORAGE_KEYS) {
+      assert.equal(store.getItem(key), null, `${key} was previewed, so it must be gone`);
+    }
+    for (const key of SECURITY_PREFERENCE_STORAGE_KEYS) {
+      assert.notEqual(store.getItem(key), null, `${key} was promised safe and got cleared`);
+    }
+    assert.equal(store.getItem(TX_HISTORY_STORAGE_KEY), "history");
+    assert.equal(store.getItem(`${INSTANCE_STORAGE_PREFIX}.testnet`), "guards");
+  });
+
+  test("the registry preview walks every concrete guard and draft key", () => {
+    const store = makeFakeStore();
+    const concrete = `${SCOPED_STORAGE_PREFIX}.policy.testnet.CAYJZT4X`;
+    store.setItem(concrete, "draft");
+    store.setItem(`${INSTANCE_STORAGE_PREFIX}.testnet`, "guards");
+    store.setItem(LEGACY_INSTANCE_STORAGE_KEY, "legacy");
+    store.setItem(LAYOUT_STORAGE_KEY, "not a guard");
+
+    const preview = previewOperatorStorageCategory("guard-registry", store);
+    assert.deepEqual(
+      [...preview.affectedKeys].sort(),
+      [`${INSTANCE_STORAGE_PREFIX}.testnet`, LEGACY_INSTANCE_STORAGE_KEY, concrete].sort(),
+    );
+    assert.equal(preview.untouchedKeys.length, 0, "only the display reset excludes preferences");
+  });
+
+  test("every key the preview shows is worded by the privacy inventory", () => {
+    // Wording comes from the inventory, so the preview and the disclosure table on
+    // the same screen cannot describe one key two ways. Templated inventory rows
+    // have to cover the concrete keys the registry reset walks.
+    const store = makeFakeStore();
+    for (const key of PRESENTATION_STORAGE_KEYS) store.setItem(key, "set");
+    const concrete = `${SCOPED_STORAGE_PREFIX}.policy.testnet.CAYJZT4X`;
+    store.setItem(concrete, "draft");
+
+    const keys = [
+      ...previewOperatorStorageCategory("layouts", store).affectedKeys,
+      ...previewOperatorStorageCategory("guard-registry", store).affectedKeys,
+      ...SECURITY_PREFERENCE_STORAGE_KEYS,
+    ];
+    assert.ok(keys.length > 1);
+    for (const key of keys) {
+      const wording = describeStorageKey(key);
+      assert.notEqual(wording, key, `${key} reached the operator with no inventory wording`);
+      assert.ok(
+        STORAGE_INVENTORY.some(
+          (entry) => entry.purpose === wording && key.startsWith(entry.key.split(".{")[0]!),
+        ),
+        `${key} was described by a sentence the inventory does not carry`,
+      );
+    }
+    assert.match(describeStorageKey(concrete), /^Per-guard drafts/);
+  });
+
+  test("every key either reset touches is disclosed in the privacy inventory", () => {
+    // Adding a preference to the reset list without adding it to the inventory
+    // would make the console delete something it claims never to keep.
+    const inventoried = new Set(
+      STORAGE_INVENTORY.filter((entry) => entry.area === "localStorage").map((entry) => entry.key),
+    );
+    for (const key of [...PRESENTATION_STORAGE_KEYS, ...SECURITY_PREFERENCE_STORAGE_KEYS]) {
+      assert.ok(
+        inventoried.has(key),
+        `${key} is reset by the console but missing from STORAGE_INVENTORY`,
+      );
+    }
   });
 
   test("StorageExplorerButton confirmation dialog states that clearing local data does not change the chain", async () => {
@@ -681,6 +867,57 @@ describe("operator browser-local storage controls and category isolation (#332)"
     await act(async () => confirmClearBtn.click());
 
     assert.equal(localStorage.getItem(TX_HISTORY_STORAGE_KEY), null);
+    await act(async () => root.unmount());
+    document.body.innerHTML = "";
+    localStorage.clear();
+  });
+
+  test("the reset dialog shows the operator what the preview promises, in inventory words", async () => {
+    installDom();
+    const { react, createRoot, act } = await loadReact();
+
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify([]));
+    localStorage.setItem(IDLE_TIMEOUT_STORAGE_KEY, String(IDLE_TIMEOUT_NEVER_MS));
+
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    const root = createRoot(div);
+    await act(async () => {
+      root.render(
+        react.createElement(
+          GuardContext.Provider,
+          { value: { server: {} as any, guard: "CA..." } as GuardContextValue },
+          react.createElement(StorageExplorerButton),
+        ),
+      );
+    });
+
+    const toggleBtn = div.querySelector(
+      'button[data-testid="storage-inventory-toggle"]',
+    ) as HTMLButtonElement;
+    await act(async () => toggleBtn.click());
+
+    // The presentation row is the only one labelled "Reset" rather than "Clear".
+    const resetBtn = div.querySelector(
+      'button[data-testid="clear-category-layouts"]',
+    ) as HTMLButtonElement;
+    assert.equal(resetBtn.textContent, "Reset");
+    await act(async () => resetBtn.click());
+
+    const preview = div.querySelector('[data-testid="clear-category-preview"]');
+    const words = preview?.textContent ?? "";
+    assert.ok(preview, "a destructive button has to be preceded by its consequences");
+    // Rendered wording, not just the model: the view resolves keys against the
+    // inventory, and that step is where a disclosure could silently disappear.
+    for (const key of [LAYOUT_STORAGE_KEY, IDLE_TIMEOUT_STORAGE_KEY]) {
+      assert.ok(
+        words.includes(describeStorageKey(key)),
+        `${key} should be named in the operator's own words; said: ${words}`,
+      );
+    }
+    assert.ok(!words.includes(IDLE_TIMEOUT_STORAGE_KEY), "raw keys are not operator copy");
+    assert.ok(words.includes("1 preference"), `expected a count of one; said: ${words}`);
+
     await act(async () => root.unmount());
     document.body.innerHTML = "";
     localStorage.clear();

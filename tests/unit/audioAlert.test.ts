@@ -3,27 +3,42 @@ import { describe, it } from "node:test";
 import type { GuardEvent } from "stellar-agent-guard-sdk";
 import {
   AudioAlerter,
+  ALERT_DEDUPE_PERSIST_LIMIT,
+  ALERT_DEDUPE_STORAGE_KEY,
   BEEP_COUNT,
   DEFAULT_ALERT_SETTINGS,
   MAX_ALERT_AUDIO_MS,
   ALERT_SETTINGS_STORAGE_KEY,
+  alertDedupeScopeKey,
+  alertEventKey,
   alertPlanDurationMs,
   alertReasonFor,
   alertTonePlan,
   alertsArmed,
+  audioEffective,
   buildNotificationPayload,
   clampVolume,
   createAlertTracker,
   deliverNotification,
+  desktopEffective,
+  describeAudioEffective,
+  describeDesktopEffective,
+  describeNotificationDelivery,
   gainForVolume,
   isSecurityCritical,
+  loadAlertDedupe,
   loadAlertSettings,
   notificationPermissionState,
+  readBrowserNotificationApi,
   requestNotificationPermission,
+  saveAlertDedupe,
   saveAlertSettings,
   type AudioContextLike,
+  type AudioEffective,
+  type DesktopEffective,
   type GainLike,
   type NotificationApi,
+  type NotificationDelivery,
   type OscillatorLike,
 } from "../../lib/guard/audioAlert.ts";
 import { withIdentity } from "../mocks/eventFixtures.ts";
@@ -419,6 +434,34 @@ describe("notification permission and delivery", () => {
       { delivered: false, reason: "failed" },
     );
   });
+
+  it("re-reads the browser's permission rather than freezing it at mount (#314)", () => {
+    class FakeNotification {
+      static permission = "default";
+      static readonly shown: { title: string; options: Record<string, unknown> }[] = [];
+      constructor(title: string, options: Record<string, unknown>) {
+        FakeNotification.shown.push({ title, options });
+      }
+    }
+
+    const api = readBrowserNotificationApi({ Notification: FakeNotification });
+    assert.ok(api);
+    assert.equal(notificationPermissionState(api), "default");
+
+    // The operator clicks Allow in the prompt. A snapshot taken at mount would
+    // keep saying "not granted" — and keep refusing deliveries the browser
+    // would now show — until the page reloaded.
+    FakeNotification.permission = "granted";
+    assert.equal(notificationPermissionState(api), "granted");
+    assert.deepEqual(
+      deliverNotification({ title: "t", body: "b", tag: "g", requireInteraction: true }, api),
+      {
+        delivered: true,
+        reason: "delivered",
+      },
+    );
+    assert.equal(FakeNotification.shown.length, 1);
+  });
 });
 
 describe("not re-alerting on an event that was already announced", () => {
@@ -473,6 +516,297 @@ describe("not re-alerting on an event that was already announced", () => {
       tracker.unseen([event({ ledger, transactionHash: `${ledger}`.padEnd(64, "0") })]);
     }
     assert.ok(tracker.size <= 3);
+  });
+});
+
+/**
+ * #313: what an alert is remembered under.
+ *
+ * The SDK's `id` is the stable answer when the feed carried one, but the
+ * committed-stream format is `ledger:<txHash>:<topic>` and one transaction can
+ * carry several guard decisions on the same topic. Keying on the id alone is the
+ * failure this issue is about: the second refusal never chimes, and the operator
+ * reads a silent console as an empty one.
+ */
+describe("alert identity (#313)", () => {
+  const sharedId = "ledger:abc123:event_auth_checked";
+
+  function blockedWith(overrides: Parameters<typeof event>[0] = {}) {
+    return event({
+      id: sharedId,
+      transactionHash: "a".repeat(64),
+      ledger: 5,
+      decision: { result: "blocked", reason: "per_tx_cap_exceeded", source: "ledger" },
+      ...overrides,
+    });
+  }
+
+  it("keeps two refusals that carry the same event id apart", () => {
+    const tracker = createAlertTracker();
+    const cap = blockedWith();
+    const unauthorized = blockedWith({
+      decision: { result: "blocked", reason: "unauthorized", source: "ledger" },
+      data: { caller: "C" + "G".repeat(55) },
+    });
+
+    assert.equal(tracker.unseen([cap, unauthorized]).length, 2);
+    assert.equal(
+      tracker.unseen([cap, unauthorized]).length,
+      0,
+      "the same two rows must not chime a second time",
+    );
+  });
+
+  it("keys on the body too, so one refusal per subject is one alert each", () => {
+    const tracker = createAlertTracker();
+    const first = blockedWith({ data: { subject: "GA" + "1".repeat(55) } });
+    const second = blockedWith({ data: { subject: "GA" + "2".repeat(55) } });
+    assert.notEqual(alertEventKey(first), alertEventKey(second));
+    assert.equal(tracker.unseen([first, second]).length, 2);
+  });
+
+  it("uses the event's own fields when there is no id to trust", () => {
+    const tracker = createAlertTracker();
+    const first = event({ id: "", ledger: 41, transactionHash: "d".repeat(64) });
+    const second = event({ id: "", ledger: 42, transactionHash: "e".repeat(64) });
+    assert.notEqual(alertEventKey(first), alertEventKey(second));
+
+    assert.deepEqual(
+      tracker.unseen([first, second]).map((entry) => entry.ledger),
+      [41, 42],
+    );
+    assert.deepEqual(tracker.unseen([first, second]), []);
+  });
+
+  it("tolerates a bigint amount instead of throwing on the whole feed", () => {
+    // Stroops arrive as `bigint`, which `JSON.stringify` *throws* on. A throw
+    // inside the alerting effect would silence every later event in the tab.
+    const cap = event({ data: { cap: 9_223_372_036_854_775_807n } });
+    assert.doesNotThrow(() => alertEventKey(cap));
+    assert.notEqual(
+      alertEventKey(cap),
+      alertEventKey(event({ data: { cap: 9_223_372_036_854_775_806n } })),
+    );
+  });
+
+  it("keeps the key bounded when the body is a policy payload", () => {
+    const huge = event({ data: { blob: "x".repeat(20_000) } });
+    assert.ok(alertEventKey(huge).length < 400, "keys go into a bounded set and into storage");
+
+    // Truncation cannot swallow a distinct event, because the identity fields
+    // still separate them: two bodies sharing a 120-character prefix with
+    // different ids are two keys.
+    const a = event({ id: "diag:aaa", data: { blob: "x".repeat(200) + "1" } });
+    const b = event({ id: "diag:bbb", data: { blob: "x".repeat(200) + "2" } });
+    assert.notEqual(alertEventKey(a), alertEventKey(b));
+  });
+});
+
+/**
+ * #313: the record behind the reload, and when it stops applying.
+ *
+ * `sessionStorage`, scoped to the network and the watched guard set: the question
+ * the record answers is "has *this tab* already chimed?", so a refresh of the
+ * same tab must stay quiet while a second tab on the wall monitor — a different
+ * operator watching it — starts clean.
+ */
+describe("alert dedupe across a reload and across scopes (#313)", () => {
+  const testnet = { network: "testnet", guards: ["GB", "GA"] };
+
+  function createDedupeStorage(initial: Record<string, string> = {}) {
+    const map = new Map<string, string>(Object.entries(initial));
+    return {
+      getItem: (key: string) => map.get(key) ?? null,
+      setItem: (key: string, value: string) => void map.set(key, value),
+      raw: () => map.get(ALERT_DEDUPE_STORAGE_KEY) ?? null,
+    };
+  }
+
+  it("carries the alerted identities over a reload", () => {
+    const storage = createDedupeStorage();
+    const tracker = createAlertTracker();
+    const refusal = event({
+      decision: { result: "blocked", reason: "paused", source: "ledger" },
+      ledger: 77,
+    });
+    tracker.unseen([refusal]);
+    saveAlertDedupe(testnet, tracker.keys(), storage);
+
+    // A reload: a fresh tab reads the record into a fresh tracker.
+    const reloaded = createAlertTracker(
+      ALERT_DEDUPE_PERSIST_LIMIT,
+      loadAlertDedupe(testnet, storage),
+    );
+    assert.equal(reloaded.unseen([refusal]).length, 0, "a reload must not re-chime its own past");
+    assert.equal(
+      reloaded.unseen([event({ ledger: 78, transactionHash: "f".repeat(64) })]).length,
+      1,
+      "and must still alert on something genuinely new",
+    );
+  });
+
+  it("writes the record under its scope, so a reload of that scope reads it back", () => {
+    const storage = createDedupeStorage();
+    saveAlertDedupe(testnet, ["k1", "k2"], storage);
+    assert.equal(JSON.parse(storage.raw()!).scope, "testnet|GA,GB");
+    assert.deepEqual(loadAlertDedupe(testnet, storage), ["k1", "k2"]);
+  });
+
+  it("starts the record over when the network changes", () => {
+    const storage = createDedupeStorage();
+    saveAlertDedupe(testnet, ["k1"], storage);
+    assert.deepEqual(loadAlertDedupe({ ...testnet, network: "pubnet" }, storage), []);
+  });
+
+  it("starts the record over when the watched guard set changes", () => {
+    const storage = createDedupeStorage();
+    saveAlertDedupe(testnet, ["k1"], storage);
+    assert.deepEqual(loadAlertDedupe({ ...testnet, guards: ["GB"] }, storage), []);
+    assert.deepEqual(loadAlertDedupe({ ...testnet, guards: ["GB", "GA", "GC"] }, storage), []);
+  });
+
+  it("counts a re-ordered guard set as the same watch list", () => {
+    const storage = createDedupeStorage();
+    saveAlertDedupe(testnet, ["k1"], storage);
+    assert.deepEqual(loadAlertDedupe({ network: "testnet", guards: ["GA", "GB"] }, storage), [
+      "k1",
+    ]);
+    assert.equal(
+      alertDedupeScopeKey(testnet),
+      alertDedupeScopeKey({ network: "testnet", guards: ["GA", "GB", "GA"] }),
+    );
+  });
+
+  it("reads nothing when the stored record is corrupt", () => {
+    for (const value of [
+      "{not json",
+      "null",
+      '"k1"',
+      '{"scope":"testnet|GA,GB","keys":"k1"}',
+      '{"scope":"testnet|GA,GB","keys":[1,null,"ok"]}',
+    ]) {
+      const storage = createDedupeStorage({ [ALERT_DEDUPE_STORAGE_KEY]: value });
+      const loaded = loadAlertDedupe(testnet, storage);
+      assert.ok(Array.isArray(loaded), `for ${value}`);
+      for (const key of loaded) assert.equal(typeof key, "string");
+    }
+  });
+
+  it("keeps only the newest identities, so the stored record is bounded too", () => {
+    const storage = createDedupeStorage();
+    const keys = Array.from({ length: ALERT_DEDUPE_PERSIST_LIMIT + 25 }, (_, index) => `k${index}`);
+    saveAlertDedupe(testnet, keys, storage);
+    const loaded = loadAlertDedupe(testnet, storage);
+    assert.equal(loaded.length, ALERT_DEDUPE_PERSIST_LIMIT);
+    assert.equal(loaded[0], `k25`, "the oldest identities are the ones dropped");
+    assert.equal(loaded.at(-1), `k${ALERT_DEDUPE_PERSIST_LIMIT + 24}`);
+  });
+
+  it("is inert with no storage at all, which is the server-render path", () => {
+    assert.deepEqual(loadAlertDedupe(testnet, null), []);
+    assert.doesNotThrow(() => saveAlertDedupe(testnet, ["k1"], null));
+  });
+});
+
+/**
+ * #314: what the panel says the channels are actually doing.
+ *
+ * Three facts get conflated by a single switch: what the operator asked for,
+ * what the browser permits, and what the last delivery did. Each is reported
+ * separately, and none of them is inferred from the others.
+ */
+describe("effective channel state (#314)", () => {
+  const shown: NotificationDelivery = { delivered: true, reason: "delivered" };
+  const refused: NotificationDelivery = { delivered: false, reason: "not-allowed" };
+
+  it("keeps the operator's switch separate from the browser's permission", () => {
+    assert.equal(desktopEffective(false, "granted", shown), "off");
+    assert.equal(desktopEffective(true, "granted", shown), "delivering");
+    assert.equal(desktopEffective(true, "default", null), "awaiting-permission");
+    assert.equal(desktopEffective(true, "denied", null), "blocked-by-browser");
+    assert.equal(desktopEffective(true, "unsupported", null), "unsupported");
+  });
+
+  it("does not claim a delivery this tab has not seen", () => {
+    // The reload case: permission was granted in an earlier session, and nothing
+    // has had to be shown since this tab opened.
+    assert.equal(desktopEffective(true, "granted", null), "ready");
+    assert.doesNotMatch(describeDesktopEffective("ready"), /delivering/);
+  });
+
+  it("reports a failed delivery as a failing channel", () => {
+    assert.equal(desktopEffective(true, "granted", refused), "failing");
+    assert.equal(
+      desktopEffective(true, "granted", { delivered: false, reason: "failed" }),
+      "failing",
+    );
+  });
+
+  it("ranks permission above an old delivery record", () => {
+    assert.equal(desktopEffective(true, "denied", shown), "blocked-by-browser");
+    assert.equal(
+      desktopEffective(true, "default", { delivered: false, reason: "failed" }),
+      "awaiting-permission",
+    );
+    assert.equal(desktopEffective(false, "denied", refused), "off");
+  });
+
+  it("gives every desktop state its own sentence, and the blocked one names the fix", () => {
+    const states: DesktopEffective[] = [
+      "off",
+      "unsupported",
+      "blocked-by-browser",
+      "awaiting-permission",
+      "ready",
+      "failing",
+      "delivering",
+    ];
+    const texts = states.map(describeDesktopEffective);
+    assert.equal(new Set(texts).size, texts.length);
+    for (const text of texts) assert.ok(text.length > 0);
+    assert.match(describeDesktopEffective("blocked-by-browser"), /site settings/);
+  });
+
+  it("reads the chime's state from the last play report, not from the switch", () => {
+    assert.equal(audioEffective(false, null), "off");
+    assert.equal(audioEffective(true, null), "needs-unlock");
+    assert.equal(
+      audioEffective(true, { played: false, reason: "not-unlocked", beeps: 0, durationMs: 190 }),
+      "needs-unlock",
+    );
+    assert.equal(
+      audioEffective(true, { played: false, reason: "unsupported", beeps: 0, durationMs: 190 }),
+      "unsupported",
+    );
+    assert.equal(
+      audioEffective(true, { played: true, reason: "played", beeps: 2, durationMs: 190 }),
+      "ready",
+    );
+  });
+
+  it("names the chime's silence as something the operator can fix", () => {
+    assert.match(describeAudioEffective("needs-unlock"), /click/);
+    assert.match(describeAudioEffective("unsupported"), /Web Audio/);
+    const texts = ["off", "unsupported", "needs-unlock", "ready"].map((state) =>
+      describeAudioEffective(state as AudioEffective),
+    );
+    assert.equal(new Set(texts).size, texts.length);
+  });
+
+  it("distinguishes the three ways a notification goes nowhere", () => {
+    const texts = (["delivered", "not-allowed", "unavailable", "failed"] as const).map((reason) =>
+      describeNotificationDelivery({ delivered: reason === "delivered", reason }),
+    );
+    for (const text of texts) assert.ok(text.length > 0);
+    assert.equal(new Set(texts).size, texts.length, "each refusal needs its own fix");
+    assert.match(
+      describeNotificationDelivery({ delivered: false, reason: "not-allowed" }),
+      /permission/i,
+    );
+    assert.match(
+      describeNotificationDelivery({ delivered: false, reason: "unavailable" }),
+      /browser/,
+    );
   });
 });
 

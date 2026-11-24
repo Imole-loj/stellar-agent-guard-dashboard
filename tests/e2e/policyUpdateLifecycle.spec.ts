@@ -63,6 +63,27 @@ test("edit, simulate, review, reject in wallet, retry, and verify a fresh chain 
   ).toBeVisible();
   await expect(panel.getByText("Per-tx cap: 1,200 stroops")).toBeVisible();
 
+  // A config that passes the form's own checks but breaks a SPEC §8 rule is
+  // preflighted with `validate_policy` before any signature (issue #259): the
+  // console names the failing rule, blocks the install, and keeps the chain
+  // untouched until the operator fixes the field.
+  await panel.getByLabel("Per-transaction cap (blank = off)").fill("7000");
+  await panel.getByRole("button", { name: "Sign and install policy" }).click();
+  const rejection = panel.locator(".error", { hasText: "The guard would reject this policy" });
+  await expect(rejection).toBeVisible();
+  await expect(rejection).toContainText(
+    "the per-transaction cap cannot exceed the rolling-window cap",
+  );
+  await expect(rejection).toContainText("Nothing was signed or submitted");
+  await expect(panel.getByRole("button", { name: "Sign and install policy" })).toBeDisabled();
+  await expect(page.getByRole("dialog", { name: "Policy changes" })).toHaveCount(0);
+  expect(chain.guards.get(predicted)?.policy).toBeNull();
+
+  // Editing the draft drops the stale verdict and re-enables the install.
+  await panel.getByLabel("Per-transaction cap (blank = off)").fill("1200");
+  await expect(panel.getByText("The guard would reject this policy")).toHaveCount(0);
+  await expect(panel.getByRole("button", { name: "Sign and install policy" })).toBeEnabled();
+
   await page.evaluate(() => localStorage.setItem("stellar-agent-guard.e2e.reject-next-sign", "1"));
   await panel.getByRole("button", { name: "Sign and install policy" }).click();
   const review = page.getByRole("dialog", { name: "Policy changes" });

@@ -9,9 +9,11 @@ import {
   diagnosticEventsOf,
   describeRejectedResult,
   invokeWithWallet,
+  isWalletCancellation,
+  isWalletRefusal,
   type WalletSigner,
 } from "../../lib/guard/submit.ts";
-import { WalletUserRejectedError } from "../../lib/guard/walletConnector.ts";
+import { WalletRefusedError, WalletUserRejectedError } from "../../lib/guard/walletConnector.ts";
 import {
   loadTxHistory,
   clearTxHistory,
@@ -874,5 +876,48 @@ describe("a declined signature is its own outcome (#291)", () => {
       "the retried transaction is bound to a fresh sequence, not the declined one's",
     );
     assert.deepEqual(prompts, ["envelope", "envelope"]);
+  });
+
+  it("handles wallet refusal distinctly from cancellation and never auto-retries (#513)", async () => {
+    assert.equal(isWalletCancellation(new WalletUserRejectedError("freighter", "sign")), true);
+    assert.equal(isWalletCancellation(new Error("User cancelled")), true);
+    assert.equal(isWalletCancellation(new Error("Permission denied by wallet policy")), false);
+
+    assert.equal(
+      isWalletRefusal(new WalletRefusedError("freighter", "sign", "policy violation")),
+      true,
+    );
+    assert.equal(isWalletRefusal(new Error("Transaction refused: unauthorized")), true);
+    assert.equal(isWalletRefusal(new Error("User cancelled")), false);
+
+    const keypair = Keypair.random();
+    const server = makeWalletBoundaryServer([]);
+    let signAttempts = 0;
+
+    const refusingSigner: WalletSigner = {
+      address: keypair.publicKey(),
+      currentAddress: async () => keypair.publicKey(),
+      async signTransaction(): Promise<string> {
+        signAttempts++;
+        throw new WalletRefusedError("freighter", "sign transaction", "Hardware policy violation");
+      },
+      async signAuthEntry(): Promise<string> {
+        throw new Error("no auth entries needed");
+      },
+    };
+
+    const refused = await invokeWithWallet({
+      ...WRITE_REQUEST,
+      server,
+      signer: refusingSigner,
+    });
+
+    assert.equal(refused.kind, "refused");
+    if (refused.kind === "refused") {
+      assert.equal(refused.stage, "wallet");
+      assert.match(refused.detail, /refused/i);
+      assert.match(refused.detail, /Hardware policy violation/i);
+    }
+    assert.equal(signAttempts, 1, "never automatically retries a refused write");
   });
 });

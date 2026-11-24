@@ -5,6 +5,7 @@ import {
   PREFERRED_WALLET_STORAGE_KEY,
   WALLET_PROVIDERS,
   WalletNotInstalledError,
+  WalletRefusedError,
   WalletUnsupportedError,
   WalletUserRejectedError,
   canReconnectSilently,
@@ -350,7 +351,7 @@ describe("network normalization", () => {
 });
 
 describe("error mapping across providers", () => {
-  it("maps each provider's failure vocabulary onto one of three outcomes", () => {
+  it("maps each provider's failure vocabulary onto distinct outcomes", () => {
     for (const id of ["freighter", "albedo", "xbull"] as WalletProviderId[]) {
       assert.ok(
         mapConnectorError(new Error("No provider found"), id, "connect") instanceof
@@ -361,6 +362,24 @@ describe("error mapping across providers", () => {
         mapConnectorError(new Error("User rejected the request"), id, "connect") instanceof
           WalletUserRejectedError,
         `${id}: a decline is the operator's own choice`,
+      );
+      assert.ok(
+        mapConnectorError(new Error("User cancelled"), id, "sign") instanceof
+          WalletUserRejectedError,
+        `${id}: user cancellation is mapped to WalletUserRejectedError`,
+      );
+      assert.ok(
+        mapConnectorError(
+          new Error("Wallet refused transaction: policy violation"),
+          id,
+          "sign",
+        ) instanceof WalletRefusedError,
+        `${id}: provider or policy refusal is distinguished from user cancellation`,
+      );
+      assert.ok(
+        mapConnectorError(new Error("Permission denied by wallet"), id, "connect") instanceof
+          WalletRefusedError,
+        `${id}: permission denied is mapped to WalletRefusedError`,
       );
       assert.ok(
         mapConnectorError("something odd", id, "connect") instanceof WalletError,

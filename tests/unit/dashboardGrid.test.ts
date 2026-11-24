@@ -171,6 +171,7 @@ test("reorderPanel clamps out-of-range indices and no-ops when already there", (
   assert.deepEqual(ids(reorderPanel(defaultLayout(), "status", 99)), [
     "txhistory",
     "panic",
+    "incident",
     "telemetry",
     "multisig",
     "xdr",
@@ -184,7 +185,15 @@ test("reordering available panels preserves missing slots and persists through r
   const storage = fakeStorage();
   const available: PanelId[] = ["status", "telemetry", "xdr"];
   const moved = reorderAvailablePanels(defaultLayout(), "telemetry", 0, available);
-  assert.deepEqual(ids(moved), ["telemetry", "txhistory", "panic", "status", "multisig", "xdr"]);
+  assert.deepEqual(ids(moved), [
+    "telemetry",
+    "txhistory",
+    "panic",
+    "incident",
+    "status",
+    "multisig",
+    "xdr",
+  ]);
   saveLayout(moved, storage);
   assert.deepEqual(ids(loadLayout(storage)), ids(moved));
   assert.deepEqual(ids(resetLayout()), [...DEFAULT_LAYOUT]);
@@ -267,7 +276,7 @@ test("keyboard move controls use rendered-panel boundaries and reset persisted o
   };
   assert.deepEqual(
     stored.data.order.map((placement) => placement.id),
-    ["telemetry", "txhistory", "panic", "status", "multisig", "xdr"],
+    ["telemetry", "txhistory", "panic", "incident", "status", "multisig", "xdr"],
   );
 
   // Reset is previewed first (#379): the click opens a dialog and leaves the
@@ -283,7 +292,7 @@ test("keyboard move controls use rendered-panel boundaries and reset persisted o
   };
   assert.deepEqual(
     unchanged.data.order.map((placement) => placement.id),
-    ["telemetry", "txhistory", "panic", "status", "multisig", "xdr"],
+    ["telemetry", "txhistory", "panic", "incident", "status", "multisig", "xdr"],
     "opening the preview does not reset anything",
   );
 

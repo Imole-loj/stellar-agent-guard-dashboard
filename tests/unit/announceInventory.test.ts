@@ -24,12 +24,17 @@ import {
   freezeConfirmed,
   freezeFailed,
   freezeSubmitted,
+  markNotStored,
+  markRejected,
+  markRemoved,
+  markSaved,
   policyConfirmed,
   policyFailed,
   streamPaused,
   streamResumed,
   writeFailureReason,
   type FreezeAction,
+  type MarkKind,
   type PolicyOperation,
 } from "../../lib/guard/announceCopy.ts";
 import { transitionCopy, type StatusTransition } from "../../lib/guard/statusTransitions.ts";
@@ -106,6 +111,19 @@ test("every operation outcome has a template, and each is wired to a call site",
       what: "a batch of blocked decisions",
       used: callSites("lib/guard/blockedEvents.ts").includes("blockedBatchMessage("),
     },
+    { what: "a mark the operator saved", used: callSites(ANNOUNCE_COPY).includes("markSaved(") },
+    {
+      what: "a mark the operator took back off",
+      used: callSites(ANNOUNCE_COPY).includes("markRemoved("),
+    },
+    {
+      what: "a mark refused with its reason",
+      used: callSites(ANNOUNCE_COPY).includes("markRejected("),
+    },
+    {
+      what: "a mark the browser would not store",
+      used: callSites(ANNOUNCE_COPY).includes("markNotStored("),
+    },
   ];
   for (const row of templates) {
     assert.equal(row.used, true, `"${row.what}" has no call site: the template is dead code`);
@@ -132,6 +150,10 @@ test("every message in the inventory is built in a copy module, not in a compone
     "Policy install failed",
     "new blocked event",
     "dead-man switch has fired",
+    "Bookmarked in this browser",
+    "Note saved in this browser",
+    "Bookmark removed",
+    "Note removed",
   ];
   for (const file of components) {
     const code = stripComments(file.text);
@@ -269,6 +291,50 @@ test("pausing and resuming the feed are announced once, with the queue depth", (
     /aria-live/.test(feed),
     false,
     "the feed must not keep its own live region: the queue is the only channel",
+  );
+});
+
+test("an operator mark is spoken as the operator's own, in the browser's words", () => {
+  // #483's failure mode is a note being read back as something the guard, the
+  // agent or the ledger recorded, so the saved message has to place the record
+  // where it actually lives.
+  const kinds: MarkKind[] = ["bookmark", "note"];
+  for (const kind of kinds) {
+    const head = kind === "bookmark" ? "Bookmark" : "Note";
+    assert.deepEqual(markSaved(kind), {
+      message: `${head === "Bookmark" ? "Bookmarked" : "Note saved"} in this browser`,
+      priority: "polite",
+    });
+    assert.deepEqual(markRemoved(kind), { message: `${head} removed`, priority: "polite" });
+    // A refusal interrupts: the operator otherwise believes they hold a record
+    // that was never written.
+    assert.deepEqual(markRejected(kind, "the list is full"), {
+      message: `${head} was not saved: the list is full`,
+      priority: "assertive",
+    });
+    assert.deepEqual(markNotStored(kind, "storage is full"), {
+      message: `${head} not stored in this browser: storage is full`,
+      priority: "assertive",
+    });
+  }
+  // The only difference between a committed row and a refusal is whether the mark
+  // can be re-read from a ledger later, and the message says so.
+  assert.equal(
+    markSaved("note", false).message,
+    "Note saved in this browser; this row has no ledger to re-read it from",
+  );
+  assert.equal(
+    markSaved("note", true).message.includes("ledger"),
+    false,
+    "an anchored row claims nothing about a ledger it does have",
+  );
+  // The mark path speaks through the queue like every other announcement, rather
+  // than through a region of its own.
+  const feed = SOURCES.find((file) => file.path === "components/TelemetryFeed.tsx")?.text ?? "";
+  assert.match(
+    feed,
+    /announce\(spoken\.message, spoken\.priority\)/,
+    "the feed must route a mark announcement through the queue",
   );
 });
 

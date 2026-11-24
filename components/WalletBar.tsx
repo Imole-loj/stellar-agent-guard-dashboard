@@ -28,9 +28,13 @@ import { OBSERVER_BADGE_LABEL, WRITE_DISABLED_HINT } from "../lib/guard/observer
 import { usePrivacy } from "../lib/guard/privacyStore.ts";
 import {
   clearWriteInterruption,
+  getPendingDisconnectGuidance,
+  getPendingWrite,
   getWriteInterruption,
   recoveryGuidance,
+  subscribePendingWrite,
   subscribeWriteInterruption,
+  type WritePhase,
 } from "../lib/guard/writeReview.ts";
 import { NETWORK, RPC_HEALTH_CAVEAT, describeRpcHealth } from "../lib/guard/network.ts";
 import {
@@ -69,6 +73,7 @@ export function WalletBar() {
   const [switchOutcome, setSwitchOutcome] = useState<NetworkSwitchOutcome | null>(null);
   const [renameTarget, setRenameTarget] = useState<GuardInstance | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<GuardInstance | null>(null);
+  const [disconnectPromptOpen, setDisconnectPromptOpen] = useState(false);
   // The last write the wallet interrupted, published by the write path. The
   // store holds no envelope and exposes no retry: reconnecting only clears the
   // way for a *fresh* review (issues #340, #341).
@@ -79,6 +84,9 @@ export function WalletBar() {
   );
   const interruptionGuidance =
     interruptionState === null ? null : recoveryGuidance(interruptionState.interruption);
+
+  // Active pending write state for disconnect safety guidance (issue #516)
+  const pendingWrite = useSyncExternalStore(subscribePendingWrite, getPendingWrite, () => null);
 
   // ── Endpoint health (issue #346) ────────────────────────────────────────
   // One read-only probe when the bar mounts, then only when the operator asks
@@ -234,7 +242,16 @@ export function WalletBar() {
                 >
                   Change wallet
                 </button>
-                <button className="secondary" onClick={disconnect}>
+                <button
+                  className="secondary"
+                  onClick={() => {
+                    if (pendingWrite) {
+                      setDisconnectPromptOpen(true);
+                    } else {
+                      disconnect();
+                    }
+                  }}
+                >
                   Disconnect
                 </button>
               </>
@@ -390,6 +407,16 @@ export function WalletBar() {
           onChoose={(id) => {
             setPickerOpen(false);
             void connect(id);
+          }}
+        />
+      )}
+      {disconnectPromptOpen && pendingWrite && (
+        <PendingDisconnectModal
+          pendingWrite={pendingWrite}
+          onClose={() => setDisconnectPromptOpen(false)}
+          onConfirm={() => {
+            setDisconnectPromptOpen(false);
+            disconnect();
           }}
         />
       )}
@@ -558,6 +585,27 @@ export function WalletPickerModal({
         <p className="tiny muted">
           Any of these can sign for a guard. The console remembers which one you use.
         </p>
+
+        {/* Read-only connection preview (issue #514) */}
+        <div
+          className="notice info"
+          role="region"
+          aria-label="Connection preview"
+          data-testid="connection-preview"
+          style={{ marginTop: 10, marginBottom: 12 }}
+        >
+          <strong>Read-only connection preview</strong>
+          <span className="tiny" style={{ display: "block", marginTop: 4 }}>
+            Connecting requests read-only access to your public Stellar address and active network (
+            {NETWORK.name}).
+          </span>
+          <span className="tiny muted" style={{ display: "block", marginTop: 4 }}>
+            No secret keys or signing authority are ever requested. Every contract write is
+            individually user-initiated. Observer mode remains active on cancel — all live
+            telemetry, status reads, and contract inspections remain available without a wallet.
+          </span>
+        </div>
+
         <div style={{ display: "grid", gap: 8, marginTop: 10 }}>
           {WALLET_PROVIDERS.map((descriptor) => {
             const detected = availableProviders.includes(descriptor.id);
@@ -595,12 +643,76 @@ export function WalletPickerModal({
           })}
         </div>
         <div className="row" style={{ marginTop: 12 }}>
-          <button className="secondary" onClick={onClose}>
-            Cancel
+          <button className="secondary" data-testid="cancel-wallet-picker" onClick={onClose}>
+            Cancel (Keep observing)
           </button>
-          <span className="tiny muted">
+          <span className="tiny muted" data-testid="observer-mode-note">
             Or keep observing — every read on this page works without a wallet.
           </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Explains consequences and safety guidance when disconnecting while a write is in flight (issue #516).
+ */
+export function PendingDisconnectModal({
+  pendingWrite,
+  onClose,
+  onConfirm,
+}: {
+  pendingWrite: { phase: WritePhase; txHash?: string | undefined };
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  const guidance = getPendingDisconnectGuidance(pendingWrite.phase, pendingWrite.txHash);
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    dialogRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => document.removeEventListener("keydown", onKeyDown, true);
+  }, [onClose]);
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="disconnect-pending-title"
+        ref={dialogRef}
+        tabIndex={-1}
+        data-testid="disconnect-pending-warning"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <strong id="disconnect-pending-title">Disconnect while write is pending?</strong>
+        <p className="tiny warn" style={{ marginTop: 8 }}>
+          {guidance.headline}
+        </p>
+        <p className="tiny" style={{ marginTop: 4 }}>
+          {guidance.detail}
+        </p>
+        <p className="tiny muted" style={{ marginTop: 4 }}>
+          {guidance.outcomeExplanation}
+        </p>
+        <div className="notice info" style={{ marginTop: 8 }}>
+          <span className="tiny">
+            <strong>Guidance:</strong> {guidance.lookupGuidance}
+          </span>
+        </div>
+        <div className="row" style={{ marginTop: 12 }}>
+          <button className="danger" onClick={onConfirm}>
+            Disconnect anyway
+          </button>
+          <button className="secondary" onClick={onClose}>
+            Keep waiting
+          </button>
         </div>
       </div>
     </div>
