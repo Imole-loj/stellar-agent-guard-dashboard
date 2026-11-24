@@ -295,6 +295,17 @@ export function PanicPanel({ ops }: { ops?: Partial<PanicPanelOps> }) {
   const [showIncidentSummary, setShowIncidentSummary] = useState(false);
   const [lastReadError, setLastReadError] = useState<string | null>(null);
   const [lastSuccessfulRead, setLastSuccessfulRead] = useState<string | null>(null);
+  // Account change tracking while confirmation dialog is open (issue #515).
+  // Captured when the dialog opens rather than in a ref, so the comparison is
+  // render-safe and the frozen address survives wallet updates.
+  const [confirmingAccount, setConfirmingAccount] = useState<string | null>(null);
+
+  const freezeAccountChanged = Boolean(
+    phase === "confirming" &&
+    confirmingAccount &&
+    wallet?.address &&
+    confirmingAccount !== wallet.address,
+  );
   // A freeze that is signing or awaiting the post-write read is a pending
   // write: an update must not replace the app underneath it (#398).
   usePwaActivity(phase === "signing" || phase === "verifying", "write");
@@ -435,6 +446,10 @@ export function PanicPanel({ ops }: { ops?: Partial<PanicPanelOps> }) {
   }
 
   async function run(action: FreezeAction, exportOnly = false) {
+    if (freezeAccountChanged) {
+      setError("Cannot submit freeze: active wallet account changed during confirmation.");
+      return;
+    }
     const lease = exportOnly
       ? null
       : acquireGuardWriteLock({ guard, action, network: lockNetwork });
@@ -591,11 +606,13 @@ export function PanicPanel({ ops }: { ops?: Partial<PanicPanelOps> }) {
           <button
             className="danger"
             ref={triggerRef}
+            data-incident-action="freeze"
             disabled={freezeControl.disabled}
             title={freezeControl.title}
             onClick={() => {
               setAcknowledged(false);
               setChallengeInput("");
+              setConfirmingAccount(wallet?.address ?? "");
               setPhase("confirming");
               setReport(null);
               // Re-read the balance at the decision point, not just at mount:
@@ -609,6 +626,7 @@ export function PanicPanel({ ops }: { ops?: Partial<PanicPanelOps> }) {
           <button
             className="secondary"
             ref={unfreezeRef}
+            data-incident-action="unfreeze"
             disabled={unfreezeControl.disabled}
             title={unfreezeControl.title}
             onClick={() => void run("unfreeze")}
@@ -721,18 +739,49 @@ export function PanicPanel({ ops }: { ops?: Partial<PanicPanelOps> }) {
                 )}
               </div>
             )}
+            {freezeAccountChanged && (
+              <div
+                className="notice warn"
+                role="alert"
+                data-testid="freeze-account-changed"
+                style={{ margin: "10px 0" }}
+              >
+                <strong>Wallet account changed during confirmation</strong>
+                <p className="tiny" style={{ margin: "4px 0" }}>
+                  The wallet account changed from <span className="mono">{confirmingAccount}</span>{" "}
+                  to <span className="mono">{wallet?.address}</span> while this dialog was open.
+                  Freeze simulation was prepared for the previous account.
+                </p>
+                <p className="tiny muted" style={{ margin: "4px 0" }}>
+                  <strong>Recovery:</strong> Cancel this confirmation to re-simulate freeze for the
+                  current account, or switch your wallet back to{" "}
+                  <span className="mono">{confirmingAccount}</span>.
+                </p>
+              </div>
+            )}
             <div className="row">
               <button
                 className="danger"
-                disabled={!acknowledged || !challengeSatisfied || pendingFreeze !== null}
-                onClick={() => void run("freeze")}
+                disabled={
+                  !acknowledged ||
+                  !challengeSatisfied ||
+                  pendingFreeze !== null ||
+                  freezeAccountChanged
+                }
+                onClick={() => {
+                  if (freezeAccountChanged) return;
+                  void run("freeze");
+                }}
               >
                 {pendingFreeze ? "Freeze pending…" : "Sign freeze"}
               </button>
               <button
                 className="secondary"
-                disabled={!acknowledged || !challengeSatisfied}
-                onClick={() => void run("freeze", true)}
+                disabled={!acknowledged || !challengeSatisfied || freezeAccountChanged}
+                onClick={() => {
+                  if (freezeAccountChanged) return;
+                  void run("freeze", true);
+                }}
               >
                 Export XDR
               </button>

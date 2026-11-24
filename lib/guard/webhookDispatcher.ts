@@ -39,6 +39,8 @@
 
 import { jsonWithBigints } from "./scval.ts";
 import type { DmsAlert } from "./dmsAlert.ts";
+import { looksLikeContractAddress, defaultGuardLabel } from "./instance.ts";
+import { findSecretKeyInText, findDisallowedLabelChar } from "./inputSanitizer.ts";
 
 // ── The alert vocabulary ───────────────────────────────────────────────────
 
@@ -128,6 +130,12 @@ export interface WebhookSettings {
   /** Refusals within `blockWindowSecs` that trigger `BLOCK_THRESHOLD_EXCEEDED`. */
   blockThreshold: number;
   blockWindowSecs: number;
+  /**
+   * Guards scoped for webhook delivery per network (issue #495).
+   * Keyed by normalized network name (e.g. "testnet", "mainnet").
+   * Defaults to empty mapping, meaning no guards are delivered until explicitly configured.
+   */
+  scopedGuards?: Record<string, string[]>;
 }
 
 /** Nothing configured: an operator has to opt in before anything leaves the tab. */
@@ -139,6 +147,7 @@ export const DEFAULT_WEBHOOK_SETTINGS: WebhookSettings = {
   minIntervalMs: DEFAULT_WEBHOOK_MIN_INTERVAL_MS,
   blockThreshold: DEFAULT_BLOCK_THRESHOLD,
   blockWindowSecs: DEFAULT_BLOCK_WINDOW_SECS,
+  scopedGuards: {},
 };
 
 /** The subset of `Storage` the store needs, so tests can inject a fake. */
@@ -233,6 +242,93 @@ function clampWindow(value: unknown): number {
   return Math.min(86_400, Math.max(10, Math.round(parsed)));
 }
 
+/** Validate and normalize scoped guards per network map. */
+export function normalizeScopedGuards(value: unknown): Record<string, string[]> {
+  if (typeof value !== "object" || value === null) return {};
+  const result: Record<string, string[]> = {};
+  for (const [net, list] of Object.entries(value)) {
+    if (typeof net !== "string") continue;
+    const cleanNet = net.trim().toLowerCase();
+    if (!cleanNet) continue;
+    if (Array.isArray(list)) {
+      const validGuards = list
+        .filter((g): g is string => typeof g === "string" && looksLikeContractAddress(g.trim()))
+        .map((g) => g.trim());
+      result[cleanNet] = [...new Set(validGuards)];
+    }
+  }
+  return result;
+}
+
+/** Return the list of guard addresses configured for delivery on this network. */
+export function getScopedGuardsForNetwork(settings: WebhookSettings, network: string): string[] {
+  const cleanNet = network.trim().toLowerCase();
+  return settings.scopedGuards?.[cleanNet] ?? [];
+}
+
+/**
+ * Check whether a guard is scoped for delivery on a network.
+ * Defaults to false (no delivery) until the operator explicitly selects the guard.
+ */
+export function isGuardScopedForDelivery(
+  settings: WebhookSettings,
+  guard: string,
+  network: string,
+): boolean {
+  if (!settings.scopedGuards) return false;
+  const list = getScopedGuardsForNetwork(settings, network);
+  return list.includes(guard.trim());
+}
+
+/** Set the list of scoped guards for a specific network. */
+export function setScopedGuardsForNetwork(
+  settings: WebhookSettings,
+  network: string,
+  guards: string[],
+): WebhookSettings {
+  const cleanNet = network.trim().toLowerCase();
+  const validGuards = [
+    ...new Set(
+      guards
+        .filter((g): g is string => typeof g === "string" && looksLikeContractAddress(g.trim()))
+        .map((g) => g.trim()),
+    ),
+  ];
+  return {
+    ...settings,
+    scopedGuards: {
+      ...(settings.scopedGuards ?? {}),
+      [cleanNet]: validGuards,
+    },
+  };
+}
+
+/**
+ * Sanitize an operator-provided label for safe attribution in webhook payloads.
+ * Strips secret keys, removes disallowed control/invisible characters, trims,
+ * and clamps to a safe maximum length. Falls back to a deterministic safe label if empty.
+ */
+export function sanitizeGuardLabel(label: unknown, fallbackGuard = ""): string {
+  if (typeof label !== "string") {
+    return fallbackGuard ? defaultGuardLabel(fallbackGuard) : "Guard";
+  }
+  // If a secret key was pasted into the label, scrub it immediately
+  if (findSecretKeyInText(label) !== null) {
+    return fallbackGuard ? defaultGuardLabel(fallbackGuard) : "Guard";
+  }
+  let clean = "";
+  for (const char of label) {
+    if (!findDisallowedLabelChar(char)) {
+      clean += char;
+    }
+  }
+  clean = clean.trim();
+  if (clean === "") {
+    return fallbackGuard ? defaultGuardLabel(fallbackGuard) : "Guard";
+  }
+  return clean.slice(0, 100);
+}
+
 /**
  * Coerce anything into valid settings.
  *
@@ -254,6 +350,7 @@ export function normalizeWebhookSettings(value: unknown): WebhookSettings {
     minIntervalMs: clampMinIntervalMs(candidate.minIntervalMs),
     blockThreshold: clampThreshold(candidate.blockThreshold),
     blockWindowSecs: clampWindow(candidate.blockWindowSecs),
+    scopedGuards: normalizeScopedGuards(candidate.scopedGuards),
   };
 }
 
@@ -321,6 +418,7 @@ export interface WebhookPayload {
   version: number;
   event: WebhookPayloadEvent;
   guard: string;
+  guardLabel?: string;
   network: string;
   /** ISO 8601, the moment the console built the payload. */
   timestamp: string;
@@ -333,9 +431,10 @@ export interface BuildPayloadInput {
   event: WebhookPayloadEvent;
   guard: string;
   network: string;
+  guardLabel?: string | null | undefined;
   /** Defaults to now; passed explicitly by the tests so a payload is reproducible. */
-  timestamp?: string;
-  details?: WebhookDetails;
+  timestamp?: string | undefined;
+  details?: WebhookDetails | undefined;
 }
 
 /**
@@ -346,10 +445,15 @@ export interface BuildPayloadInput {
  * the same values regardless of how the caller assembled the details.
  */
 export function buildWebhookPayload(input: BuildPayloadInput, secret = ""): WebhookPayload {
+  const safeLabel =
+    input.guardLabel !== undefined && input.guardLabel !== null
+      ? sanitizeGuardLabel(input.guardLabel, input.guard)
+      : undefined;
   return {
     version: WEBHOOK_PAYLOAD_VERSION,
     event: input.event,
     guard: input.guard,
+    ...(safeLabel !== undefined ? { guardLabel: safeLabel } : {}),
     network: input.network,
     timestamp: input.timestamp ?? new Date().toISOString(),
     signed: secret.trim() !== "",
@@ -488,9 +592,16 @@ export function isRateLimited(
 export function dueWebhookEvents(input: {
   settings: WebhookSettings;
   events: readonly WebhookEventType[];
+  guard?: string;
+  network?: string;
   lastSentAt?: Partial<Record<WebhookEventType, number>>;
   nowMs: number;
 }): WebhookEventType[] {
+  if (input.guard && input.network) {
+    if (!isGuardScopedForDelivery(input.settings, input.guard, input.network)) {
+      return [];
+    }
+  }
   const selected = new Set(input.settings.events);
   return input.events.filter(
     (event) =>
@@ -615,6 +726,15 @@ export async function dispatchWebhook(
   ) {
     return notSent("skipped", `${payload.event} is not one of the selected alert types.`);
   }
+  if (
+    payload.event !== WEBHOOK_PING_EVENT &&
+    !isGuardScopedForDelivery(settings, payload.guard, payload.network)
+  ) {
+    return notSent(
+      "skipped",
+      `Guard ${payload.guard} is not configured for webhook delivery on ${payload.network}.`,
+    );
+  }
 
   const doFetch = deps.fetch ?? globalThis.fetch;
   if (typeof doFetch !== "function") {
@@ -695,12 +815,14 @@ export async function dispatchWebhook(
 export function buildVerificationPing(input: {
   guard: string;
   network: string;
-  timestamp?: string;
+  guardLabel?: string | null | undefined;
+  timestamp?: string | undefined;
 }): WebhookPayload {
   return buildWebhookPayload({
     event: WEBHOOK_PING_EVENT,
     guard: input.guard,
     network: input.network,
+    ...(input.guardLabel !== undefined ? { guardLabel: input.guardLabel } : {}),
     ...(input.timestamp === undefined ? {} : { timestamp: input.timestamp }),
     details: {
       message: "Verification ping from the Stellar Agent Guard dashboard.",

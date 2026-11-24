@@ -36,6 +36,7 @@ import {
   clearOperatorStorageCategory,
   explorerReducer,
   getOperatorStorageCategories,
+  previewOperatorStorageCategory,
   summarizeEntries,
   visibleEntries,
   type ExplorerAction,
@@ -46,7 +47,7 @@ import {
   type StorageEntryView,
 } from "../lib/guard/storage.ts";
 import { announce } from "../lib/guard/useAnnounce.ts";
-import { STORAGE_INVENTORY } from "../lib/guard/storageInventory.ts";
+import { describeStorageKey, STORAGE_INVENTORY } from "../lib/guard/storageInventory.ts";
 
 /** The badge class for a TTL tier — the tokens the rest of the interface uses. */
 const TIER_CLASS: Record<StorageEntryView["ttlTier"], string> = {
@@ -368,6 +369,18 @@ export function StorageExplorerButton() {
   );
   const [confirmCategory, setConfirmCategory] = useState<OperatorStorageCategoryInfo | null>(null);
 
+  /**
+   * What the pending clear would actually change, named.
+   *
+   * Derived from live storage rather than the counts captured when the inventory
+   * opened: a preview that disagrees with the button beneath it is worse than no
+   * preview, and the operator may have another tab open on the same origin.
+   */
+  const preview = useMemo(
+    () => (confirmCategory ? previewOperatorStorageCategory(confirmCategory.id) : null),
+    [confirmCategory],
+  );
+
   return (
     <>
       <button
@@ -444,7 +457,7 @@ export function StorageExplorerButton() {
                           onClick={() => setConfirmCategory(cat)}
                           data-testid={`clear-category-${cat.id}`}
                         >
-                          Clear
+                          {cat.actionLabel}
                         </button>
                       </td>
                     </tr>
@@ -465,13 +478,56 @@ export function StorageExplorerButton() {
                 data-testid="clear-category-confirm"
               >
                 <p style={{ margin: 0 }}>
-                  <strong>Clear {confirmCategory.name}?</strong>
+                  <strong>
+                    {confirmCategory.actionLabel} {confirmCategory.name}?
+                  </strong>
                 </p>
                 <p className="tiny" style={{ margin: "6px 0 10px 0" }}>
-                  Clearing local records removes {confirmCategory.name.toLowerCase()} stored in this
-                  browser only. It does not change the chain or affect any on-chain accounts,
-                  contracts, or transactions.
+                  {confirmCategory.actionLabel === "Reset"
+                    ? "This returns display settings to their defaults in this browser only. The controls that own them keep working, and nothing on the chain is touched."
+                    : `Local records only: this removes ${confirmCategory.name.toLowerCase()} stored in this browser. It does not change the chain or affect any on-chain accounts, contracts, or transactions.`}
                 </p>
+
+                {preview && (
+                  <div data-testid="clear-category-preview">
+                    {preview.empty ? (
+                      <p className="tiny" style={{ margin: "0 0 10px 0" }}>
+                        Nothing in this category is stored in this browser right now, so confirming
+                        changes nothing.
+                      </p>
+                    ) : (
+                      <>
+                        <p className="tiny" style={{ margin: "0 0 2px 0" }}>
+                          <strong>
+                            {confirmCategory.actionLabel === "Reset"
+                              ? `This returns ${preview.affectedKeys.length} preference${
+                                  preview.affectedKeys.length === 1 ? "" : "s"
+                                } to its default:`
+                              : `This removes ${preview.affectedKeys.length} stored record${
+                                  preview.affectedKeys.length === 1 ? "" : "s"
+                                }:`}
+                          </strong>
+                        </p>
+                        <ul className="tiny" style={{ margin: "0 0 8px 18px", padding: 0 }}>
+                          {preview.affectedKeys.map((key) => (
+                            <li key={key}>{describeStorageKey(key)}</li>
+                          ))}
+                        </ul>
+                        <p className="tiny" style={{ margin: "0 0 2px 0" }}>
+                          <strong>This leaves untouched:</strong>
+                        </p>
+                        <ul className="tiny" style={{ margin: "0 0 10px 18px", padding: 0 }}>
+                          {[
+                            ...preview.untouched,
+                            ...preview.untouchedKeys.map(describeStorageKey),
+                          ].map((label) => (
+                            <li key={label}>{label}</li>
+                          ))}
+                        </ul>
+                      </>
+                    )}
+                  </div>
+                )}
                 <div className="row" style={{ gap: 8 }}>
                   <button
                     type="button"
@@ -479,14 +535,16 @@ export function StorageExplorerButton() {
                     onClick={() => {
                       clearOperatorStorageCategory(confirmCategory.id);
                       announce(
-                        `Cleared ${confirmCategory.name} from browser storage. On-chain state is unchanged.`,
+                        confirmCategory.actionLabel === "Reset"
+                          ? `${confirmCategory.name} reset to their defaults. Saved guards, drafts and security settings are untouched, and on-chain state is unchanged.`
+                          : `Cleared ${confirmCategory.name} from browser storage. On-chain state is unchanged.`,
                       );
                       setConfirmCategory(null);
                       setCategories(getOperatorStorageCategories());
                     }}
                     data-testid={`confirm-clear-${confirmCategory.id}`}
                   >
-                    Confirm Clear
+                    {`Confirm ${confirmCategory.actionLabel}`}
                   </button>
                   <button
                     type="button"

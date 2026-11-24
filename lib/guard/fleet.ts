@@ -3,6 +3,7 @@ import type { Contact } from "./addressBook.ts";
 import * as guardOps from "./guardOps.ts";
 import type { GuardSnapshot } from "./guardOps.ts";
 import { NETWORK } from "./network.ts";
+import { formatStroops } from "./formatters.ts";
 
 export type DerivedStatus = "Active" | "Frozen" | "Expired" | "Unknown";
 
@@ -195,4 +196,128 @@ export function sortFleet(
       return byKey !== 0 ? byKey : a.index - b.index;
     })
     .map((entry) => entry.row);
+}
+
+// ── Multi-Guard Policy Review Report (Issue #477) ──────────────────────────
+
+export interface FleetPolicyReportEntry {
+  guard: string;
+  label: string;
+  network: string;
+  readOutcome: "success" | "failed";
+  error: string | null;
+  hasPolicy: boolean | null;
+  policySummary: string;
+  adminFrozen: boolean | null;
+  heartbeatExpired: boolean | null;
+  dmsGraceSecs: string | null;
+}
+
+export interface FleetPolicyReport {
+  capturedAt: string;
+  totalGuards: number;
+  successfulReads: number;
+  failedReads: number;
+  isPartial: boolean;
+  network: string;
+  entries: FleetPolicyReportEntry[];
+}
+
+/**
+ * Generate a safe multi-guard policy review report from fleet rows.
+ *
+ * Failed reads are surfaced explicitly as failures with their respective error messages,
+ * ensuring auditors never mistake an unread contract for an empty policy.
+ */
+export function generateFleetPolicyReport(
+  rows: readonly FleetRow[],
+  capturedAt: Date = new Date(),
+): FleetPolicyReport {
+  const entries: FleetPolicyReportEntry[] = rows.map((row) => {
+    const snap = row.snapshot;
+    const statusResult = snap?.status;
+    const readFailed = Boolean(row.error || !statusResult || !statusResult.ok);
+    if (readFailed || !statusResult || !statusResult.ok) {
+      const errorMsg =
+        row.error || (!statusResult?.ok ? statusResult?.error : undefined) || "Read failed";
+      return {
+        guard: row.contact.address,
+        label: row.contact.label,
+        network: row.network,
+        readOutcome: "failed",
+        error: errorMsg,
+        hasPolicy: null,
+        policySummary: `[READ FAILED: ${errorMsg}]`,
+        adminFrozen: null,
+        heartbeatExpired: null,
+        dmsGraceSecs: null,
+      };
+    }
+
+    const statusVal = statusResult.value;
+    const policyOk = snap?.policy.ok;
+    const policyVal = snap?.policy.ok ? snap.policy.value : null;
+    const policyErr = snap && !snap.policy.ok ? snap.policy.error : null;
+
+    let policySummary = "No Policy (Default-Deny)";
+    if (statusVal.has_policy && policyVal) {
+      const perTx = formatStroops(policyVal.per_tx_cap);
+      const windowCap = formatStroops(policyVal.window_cap);
+      policySummary = `Per-Tx: ${perTx} XLM, Window: ${windowCap} XLM (${policyVal.window_secs}s)`;
+    } else if (!policyOk && policyErr) {
+      policySummary = `[POLICY READ ERROR: ${policyErr}]`;
+    }
+
+    return {
+      guard: row.contact.address,
+      label: row.contact.label,
+      network: row.network,
+      readOutcome: "success",
+      error: null,
+      hasPolicy: statusVal.has_policy,
+      policySummary,
+      adminFrozen: statusVal.admin_frozen,
+      heartbeatExpired: statusVal.heartbeat_expired,
+      dmsGraceSecs: policyVal ? String(policyVal.dms_grace_secs) : null,
+    };
+  });
+
+  const failedReads = entries.filter((e) => e.readOutcome === "failed").length;
+  const successfulReads = entries.length - failedReads;
+
+  return {
+    capturedAt: capturedAt.toISOString(),
+    totalGuards: entries.length,
+    successfulReads,
+    failedReads,
+    isPartial: failedReads > 0,
+    network: rows[0]?.network ?? NETWORK.name,
+    entries,
+  };
+}
+
+/**
+ * Render policy report in human-readable Markdown format for forensic review.
+ */
+export function formatFleetPolicyReportMarkdown(report: FleetPolicyReport): string {
+  const lines: string[] = [
+    `# Fleet Policy Review Report`,
+    ``,
+    `- Captured At: ${report.capturedAt}`,
+    `- Network: ${report.network}`,
+    `- Total Guards: ${report.totalGuards}`,
+    `- Successful Reads: ${report.successfulReads}`,
+    `- Failed Reads: ${report.failedReads}`,
+    `- Report Status: ${report.isPartial ? "PARTIAL (One or more guard reads failed)" : "COMPLETE"}`,
+    ``,
+    `| Guard Address | Label | Read Outcome | Has Policy | Policy Summary | Freeze | DMS Grace |`,
+    `| --- | --- | --- | --- | --- | --- | --- |`,
+  ];
+
+  for (const e of report.entries) {
+    lines.push(
+      `| \`${e.guard}\` | ${e.label} | ${e.readOutcome} | ${e.hasPolicy === null ? "N/A" : e.hasPolicy ? "Yes" : "No"} | ${e.policySummary} | ${e.adminFrozen ? "FROZEN" : "No"} | ${e.dmsGraceSecs ?? "N/A"} |`,
+    );
+  }
+  return lines.join("\n");
 }

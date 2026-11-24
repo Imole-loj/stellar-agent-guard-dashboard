@@ -309,3 +309,90 @@ export function clearWriteInterruption(): void {
   interruptionState = null;
   for (const listener of listeners) listener();
 }
+
+// ── Pending write tracking and disconnect guidance (issue #516) ───────────
+
+export interface PendingWriteState {
+  phase: WritePhase;
+  startedAt: string;
+  txHash?: string | undefined;
+}
+
+let pendingWrite: PendingWriteState | null = null;
+const pendingWriteListeners = new Set<() => void>();
+
+export function getPendingWrite(): PendingWriteState | null {
+  return pendingWrite;
+}
+
+export function subscribePendingWrite(listener: () => void): () => void {
+  pendingWriteListeners.add(listener);
+  return () => {
+    pendingWriteListeners.delete(listener);
+  };
+}
+
+export function setPendingWrite(phase: WritePhase | null, txHash?: string): void {
+  if (phase === null) {
+    pendingWrite = null;
+  } else {
+    pendingWrite = {
+      phase,
+      startedAt: new Date().toISOString(),
+      ...(txHash !== undefined ? { txHash } : {}),
+    };
+  }
+  for (const listener of pendingWriteListeners) listener();
+}
+
+export interface PendingDisconnectGuidance {
+  phase: WritePhase;
+  headline: string;
+  detail: string;
+  outcomeExplanation: string;
+  lookupGuidance: string;
+  canCancelSafely: boolean;
+}
+
+export function getPendingDisconnectGuidance(
+  phase: WritePhase,
+  txHash?: string,
+): PendingDisconnectGuidance {
+  if (phase === "submission") {
+    return {
+      phase,
+      headline: "A transaction is currently being submitted to the network.",
+      detail:
+        "Disconnecting now will NOT cancel the transaction on the Stellar network. The transaction may already be accepted or included in a ledger.",
+      outcomeExplanation:
+        "Once broadcast, transactions cannot be cancelled by disconnecting your wallet. Disconnecting only stops this browser from monitoring the RPC response.",
+      lookupGuidance: txHash
+        ? `Check Transaction History or query the network directly using transaction hash: ${txHash}.`
+        : "Check Transaction History or Horizon/RPC to confirm whether the transaction was included in a ledger.",
+      canCancelSafely: false,
+    };
+  }
+  if (phase === "envelope") {
+    return {
+      phase,
+      headline: "Transaction envelope signing is in progress.",
+      detail:
+        "Your wallet may have already signed the envelope, but it has not yet been broadcast to the network.",
+      outcomeExplanation:
+        "If you disconnect now, this dashboard will not submit the transaction. However, check Transaction History before reconnecting to confirm no envelope was submitted.",
+      lookupGuidance:
+        "Check Transaction History to verify the state of your account before initiating another write.",
+      canCancelSafely: true,
+    };
+  }
+  return {
+    phase,
+    headline: `A contract call write is currently in the ${PHASE_LABEL[phase]} stage.`,
+    detail:
+      "The transaction has not been assembled or submitted to the network. Disconnecting will safely abort this review.",
+    outcomeExplanation:
+      "Nothing was broadcast to the network. No fees have been charged and no ledger state has changed.",
+    lookupGuidance: "You can reconnect your wallet at any time to start a fresh review.",
+    canCancelSafely: true,
+  };
+}

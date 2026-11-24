@@ -5,11 +5,20 @@ import { ALERT_SETTINGS_STORAGE_KEY } from "./audioAlert.ts";
 import { DENSITY_STORAGE_KEY } from "./densityStore.ts";
 import { SCOPED_STORAGE_PREFIX } from "./guardScoped.ts";
 import { INSTANCE_STORAGE_PREFIX, LEGACY_INSTANCE_STORAGE_KEY } from "./instance.ts";
-import { LAYOUT_STORAGE_KEY } from "./layoutStore.ts";
-import { SIDEBAR_COLLAPSED_STORAGE_KEY, THEME_STORAGE_KEY } from "./presentationStorageKeys.ts";
+import { LAYOUT_STORAGE_KEY, NAMED_LAYOUTS_STORAGE_KEY } from "./layoutStore.ts";
+import {
+  FLEET_VIEW_STORAGE_KEY,
+  SIDEBAR_COLLAPSED_STORAGE_KEY,
+  THEME_STORAGE_KEY,
+} from "./presentationStorageKeys.ts";
 import { PRIVACY_MASK_STORAGE_KEY } from "./privacyStore.ts";
 import { SETUP_STORAGE_KEY } from "./setupChecklist.ts";
-import { clearTxHistory, loadTxHistory, type StorageLike } from "./txHistory.ts";
+import {
+  clearTxHistory,
+  loadTxHistory,
+  TX_HISTORY_STORAGE_KEY,
+  type StorageLike,
+} from "./txHistory.ts";
 import { IDLE_TIMEOUT_STORAGE_KEY } from "./useIdleTimer.ts";
 import { PREFERRED_WALLET_STORAGE_KEY } from "./walletConnector.ts";
 
@@ -584,19 +593,211 @@ export interface OperatorStorageCategoryInfo {
   name: string;
   description: string;
   itemCount: number;
+  /**
+   * "Reset" or "Clear", and the difference is the point of issue #529.
+   *
+   * Presentation settings have a default to return to, so the honest verb is
+   * *reset*; the other three categories delete records the operator typed or
+   * that the chain produced, which is *clearing* and has no default to fall back
+   * to. One button label for both taught operators to distrust the button.
+   */
+  actionLabel: "Reset" | "Clear";
 }
 
-export const LAYOUT_STORAGE_KEYS: readonly string[] = [
+/**
+ * What "reset my display" means, and — as importantly — what it does not.
+ *
+ * Issue #529 split this list out of the older `LAYOUT_STORAGE_KEYS`, which was
+ * both too wide and too narrow. Too wide: it carried the idle-lock duration and
+ * the opt-in value masking, so an operator who had arranged their panels badly
+ * and reached for the layout reset also silently lost the lock timer they had
+ * set, or the masking they had turned on to work in public. Two preferences
+ * whose whole purpose is to be *less* convenient are not display settings.
+ * Too narrow: it missed named layouts and the fleet table's view state, which
+ * are pure display settings and did not get reset.
+ *
+ * The rule this list follows: a key belongs here when losing it costs the
+ * operator only arrangement — the console still shows the same chain truth, the
+ * same guards, the same drafts, and the same protections. Anything that changes
+ * what the console *does*, rather than how it looks, is a data or security
+ * preference and stays in its own category.
+ *
+ * `SECURITY_PREFERENCE_STORAGE_KEYS` is exported beside it and named in the
+ * preview so the exclusion is visible at the moment of the decision, instead of
+ * being a property of this file that only a reader of source can find.
+ */
+export const PRESENTATION_STORAGE_KEYS: readonly string[] = [
   LAYOUT_STORAGE_KEY,
+  NAMED_LAYOUTS_STORAGE_KEY,
+  FLEET_VIEW_STORAGE_KEY,
   THEME_STORAGE_KEY,
   DENSITY_STORAGE_KEY,
   SIDEBAR_COLLAPSED_STORAGE_KEY,
-  PRIVACY_MASK_STORAGE_KEY,
-  IDLE_TIMEOUT_STORAGE_KEY,
   ALERT_SETTINGS_STORAGE_KEY,
-  SETUP_STORAGE_KEY,
   PREFERRED_WALLET_STORAGE_KEY,
+  SETUP_STORAGE_KEY,
 ];
+
+/**
+ * Preferences that read like display settings and are not.
+ *
+ * Both default to the *less* protective choice, so clearing them on the way past
+ * a layout reset is a downgrade the operator never asked for. They stay here as
+ * a named list so the preview can say so out loud, and so the only way to change
+ * one is the control that owns it.
+ */
+export const SECURITY_PREFERENCE_STORAGE_KEYS: readonly string[] = [
+  IDLE_TIMEOUT_STORAGE_KEY,
+  PRIVACY_MASK_STORAGE_KEY,
+];
+
+export interface OperatorStoragePreview {
+  category: OperatorStorageCategory;
+  /** What the reset removes — only keys actually present in this browser. */
+  affectedKeys: readonly string[];
+  /** What the reset deliberately leaves alone, stated so the boundary is visible. */
+  untouched: readonly string[];
+  /**
+   * Preferences outside the category that the reset still declines to touch.
+   *
+   * Keys, not sentences: the wording belongs to the privacy inventory, and this
+   * module must not import it — `storage.ts` sits inside the `chain → storage`
+   * import loop, and the inventory reaches back into it through the wallet
+   * modules, so the edge would be a cycle that fails at load with a TDZ error.
+   * The view that already holds both resolves them.
+   */
+  untouchedKeys: readonly string[];
+  /** True when there is nothing to remove, so the caller can say so instead. */
+  empty: boolean;
+}
+
+/**
+ * Which of `keys` are actually stored, in the order the reset lists them.
+ *
+ * Presence is decided by `getItem`, not by a cached count: the preview has to
+ * agree with what the clear will do a moment later, and a count taken when the
+ * drawer opened would not.
+ */
+function presentKeys(keys: readonly string[], store: StorageLike): string[] {
+  const present: string[] = [];
+  for (const key of keys) {
+    try {
+      if (store.getItem(key) !== null) present.push(key);
+    } catch {
+      // An unreadable key is not a key we can promise to remove; the reset will
+      // report whatever it does instead of the preview guessing.
+    }
+  }
+  return present;
+}
+
+/** The operator data this console keeps, described once and reused by the preview. */
+const DATA_UNTOUCHED = {
+  registry: "Saved guards and per-guard drafts",
+  addressBook: "Address book contacts",
+  history: "Transaction history",
+  webhooks: "Webhook destinations",
+} as const;
+
+/**
+ * Which reassurance belongs to which reset, by what that reset does *not* cover.
+ *
+ * Hand-curated rather than derived from the key lists because the operator is
+ * reading it, not diffing it: the sentence has to name the things they would miss.
+ * The security pair is the exception — it travels as `untouchedKeys`, resolved
+ * against the privacy inventory by the view, so a third setting added to
+ * `SECURITY_PREFERENCE_STORAGE_KEYS` turns up in the preview without anyone
+ * remembering to edit a string.
+ */
+const UNTOUCHED_NOTES: Record<OperatorStorageCategory, readonly string[]> = {
+  layouts: [
+    DATA_UNTOUCHED.registry,
+    DATA_UNTOUCHED.addressBook,
+    DATA_UNTOUCHED.history,
+    DATA_UNTOUCHED.webhooks,
+  ],
+  "address-book": [
+    DATA_UNTOUCHED.registry,
+    DATA_UNTOUCHED.history,
+    DATA_UNTOUCHED.webhooks,
+    "Presentation preferences",
+  ],
+  history: [
+    DATA_UNTOUCHED.registry,
+    DATA_UNTOUCHED.addressBook,
+    DATA_UNTOUCHED.webhooks,
+    "Presentation preferences",
+  ],
+  "guard-registry": [
+    DATA_UNTOUCHED.addressBook,
+    DATA_UNTOUCHED.history,
+    DATA_UNTOUCHED.webhooks,
+    "Presentation preferences",
+  ],
+};
+
+/**
+ * Say what a reset would change before it changes anything (issue #529).
+ *
+ * Every destructive control in this console needs the same two answers — what
+ * goes, and what is safe — and the second one is the answer the operator is
+ * actually buying. Clearing the display arrangement should never be a way to
+ * lose a saved guard, a half-written policy draft, the address book or the
+ * idle-lock setting, so the preview names each of those as untouched.
+ */
+export function previewOperatorStorageCategory(
+  category: OperatorStorageCategory,
+  storage?: StorageLike | null,
+): OperatorStoragePreview {
+  const store =
+    storage === undefined ? (typeof window !== "undefined" ? window.localStorage : null) : storage;
+
+  if (!store) {
+    return { category, affectedKeys: [], untouched: [], untouchedKeys: [], empty: true };
+  }
+
+  let affected: string[];
+  switch (category) {
+    case "layouts":
+      affected = presentKeys(PRESENTATION_STORAGE_KEYS, store);
+      break;
+    case "address-book":
+      affected = presentKeys([ADDRESS_BOOK_STORAGE_KEY], store);
+      break;
+    case "history":
+      affected = presentKeys([TX_HISTORY_STORAGE_KEY], store);
+      break;
+    case "guard-registry":
+      affected = presentRegistryKeys(store);
+      break;
+  }
+
+  return {
+    category,
+    affectedKeys: affected,
+    untouched: UNTOUCHED_NOTES[category],
+    untouchedKeys: category === "layouts" ? SECURITY_PREFERENCE_STORAGE_KEYS : [],
+    empty: affected.length === 0,
+  };
+}
+
+/** Every concrete key the guard-registry reset walks, across networks and guards. */
+function presentRegistryKeys(store: StorageLike): string[] {
+  const keys: string[] = [];
+  for (const key of getAllStorageKeys(store)) {
+    const inRegistry =
+      key.startsWith(INSTANCE_STORAGE_PREFIX) ||
+      key === LEGACY_INSTANCE_STORAGE_KEY ||
+      key.startsWith(SCOPED_STORAGE_PREFIX);
+    if (!inRegistry) continue;
+    try {
+      if (store.getItem(key) !== null) keys.push(key);
+    } catch {
+      // Unreadable: skip, as in `presentKeys`.
+    }
+  }
+  return keys;
+}
 
 function getAllStorageKeys(storage: StorageLike): string[] {
   if (typeof (storage as any).length === "number" && typeof (storage as any).key === "function") {
@@ -645,7 +846,7 @@ export function getOperatorStorageCategories(
 
   let layoutsCount = 0;
   if (store) {
-    for (const key of LAYOUT_STORAGE_KEYS) {
+    for (const key of PRESENTATION_STORAGE_KEYS) {
       if (store.getItem(key) !== null) {
         layoutsCount += 1;
       }
@@ -685,24 +886,29 @@ export function getOperatorStorageCategories(
       name: "Transaction History",
       description: "Transaction hashes, operations, outcomes, and fees recorded by this browser.",
       itemCount: historyCount,
+      actionLabel: "Clear",
     },
     {
       id: "address-book",
       name: "Address Book",
       description: "Contact nicknames and public Stellar addresses saved locally.",
       itemCount: addressBookCount,
+      actionLabel: "Clear",
     },
     {
       id: "layouts",
-      name: "Layouts & UI Preferences",
-      description: "Dashboard panel layout order, theme, density, and display preferences.",
+      name: "Presentation preferences",
+      description:
+        "Panel arrangement, named layouts, the fleet table view, theme, density, alert sounds, setup progress and the remembered wallet. Guard registrations, drafts, transaction history, the address book, the idle-lock duration and value masking are not part of this reset.",
       itemCount: layoutsCount,
+      actionLabel: "Reset",
     },
     {
       id: "guard-registry",
       name: "Guard Registry",
       description: "Saved public guard addresses, nicknames, and per-guard operational drafts.",
       itemCount: guardRegistryCount,
+      actionLabel: "Clear",
     },
   ];
 }
@@ -736,7 +942,7 @@ export function clearOperatorStorageCategory(
       break;
 
     case "layouts":
-      for (const key of LAYOUT_STORAGE_KEYS) {
+      for (const key of PRESENTATION_STORAGE_KEYS) {
         removeKey(key);
       }
       break;

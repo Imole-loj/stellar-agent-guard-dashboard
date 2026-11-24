@@ -9,6 +9,7 @@
   - [No Mock State](concepts/no-mock-state.md)
 - [Screens & Actions](screens/)
   - [Overview Screen](screens/overview.md)
+  - [Fleet Overview](screens/fleet-overview.md)
   - [Policy Configurator](screens/policy-configurator.md)
   - [Deploy Panel](screens/deploy-panel.md)
   - [Panic Button & Freeze](screens/panic-freeze.md)

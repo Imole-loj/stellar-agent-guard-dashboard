@@ -18,8 +18,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useGuard } from "./GuardProvider.tsx";
-import { ErrorBlock } from "./bits.tsx";
+import { ErrorBlock, short } from "./bits.tsx";
 import { NETWORK } from "../lib/guard/network.ts";
+import { defaultGuardLabel } from "../lib/guard/instance.ts";
 import { announce } from "../lib/guard/useAnnounce.ts";
 import {
   DEFAULT_WEBHOOK_SETTINGS,
@@ -30,9 +31,11 @@ import {
   buildVerificationPing,
   describeDispatch,
   dispatchWebhook,
+  getScopedGuardsForNetwork,
   loadWebhookSettings,
   normalizeWebhookSettings,
   saveWebhookSettings,
+  setScopedGuardsForNetwork,
   validateWebhookUrl,
   webhookConfigProblem,
   type DispatchResult,
@@ -77,12 +80,41 @@ export function WebhookSettingsButton() {
 }
 
 export function WebhookSettingsModal({ onClose }: { onClose: () => void }) {
-  const { guard } = useGuard();
+  const { guard, instances = [], activeInstance } = useGuard();
   const [settings, setSettings] = useState<WebhookSettings>(() => loadWebhookSettings());
   const [error, setError] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const [ping, setPing] = useState<DispatchResult | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
+
+  const networkName = NETWORK.name;
+  const currentNetKey = networkName.trim().toLowerCase();
+  const instancesList = instances ?? [];
+  const knownGuards = instancesList.filter(
+    (inst) => !inst.network || inst.network.toLowerCase() === currentNetKey,
+  );
+  // Ensure the active guard is represented in available guards if not already present
+  const availableGuards = [...knownGuards];
+  if (guard && !availableGuards.some((inst) => inst.guard === guard)) {
+    availableGuards.unshift({
+      guard,
+      label: activeInstance?.label ?? defaultGuardLabel(guard),
+      network: networkName,
+      addedAt: "",
+      provenance: "Active guard",
+    });
+  }
+
+  const scopedForCurrentNet = getScopedGuardsForNetwork(settings, networkName);
+
+  function toggleGuard(guardAddress: string) {
+    const currentList = getScopedGuardsForNetwork(settings, networkName);
+    const nextList = currentList.includes(guardAddress)
+      ? currentList.filter((g) => g !== guardAddress)
+      : [...currentList, guardAddress];
+    setSettings((current) => setScopedGuardsForNetwork(current, networkName, nextList));
+    setPing(null);
+  }
 
   useEffect(() => {
     dialogRef.current?.focus();
@@ -146,7 +178,11 @@ export function WebhookSettingsModal({ onClose }: { onClose: () => void }) {
       return;
     }
     const result = await dispatchWebhook(
-      buildVerificationPing({ guard, network: NETWORK.name }),
+      buildVerificationPing({
+        guard,
+        network: NETWORK.name,
+        guardLabel: activeInstance?.label ?? defaultGuardLabel(guard),
+      }),
       candidate,
     );
     setPing(result);
@@ -243,6 +279,47 @@ export function WebhookSettingsModal({ onClose }: { onClose: () => void }) {
               </span>
             </label>
           ))}
+        </div>
+
+        <div className="stack" style={{ marginTop: 12 }} data-testid="webhook-scoped-guards">
+          <span className="lbl">Scoped guards ({networkName})</span>
+          <span className="hint">
+            Only alerts from selected guards on this network will be delivered. Defaults to no
+            delivery until configured.
+          </span>
+          {availableGuards.length === 0 ? (
+            <p className="tiny muted">No guards registered for {networkName}.</p>
+          ) : (
+            <div className="stack" style={{ gap: 6, marginTop: 4 }}>
+              {availableGuards.map((item) => {
+                const isSelected = scopedForCurrentNet.includes(item.guard);
+                return (
+                  <label className="checkline" key={item.guard}>
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      onChange={() => toggleGuard(item.guard)}
+                      aria-label={`Deliver alerts for ${item.label}`}
+                    />
+                    <span>
+                      <strong style={{ fontSize: 13 }}>{item.label}</strong>{" "}
+                      <span className="mono tiny muted">{short(item.guard)}</span>
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+          )}
+          {scopedForCurrentNet.length === 0 && (
+            <span
+              className="hint"
+              style={{ color: "var(--muted)", fontStyle: "italic" }}
+              data-testid="webhook-no-guards-hint"
+            >
+              No guards selected for {networkName}. Webhooks default to no delivery until at least
+              one guard is configured.
+            </span>
+          )}
         </div>
 
         <div className="row" style={{ marginTop: 10, gap: 12 }}>

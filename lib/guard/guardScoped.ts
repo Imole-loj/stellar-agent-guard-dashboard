@@ -28,8 +28,12 @@ export const SCOPED_STORAGE_PREFIX = "stellar-agent-guard-dashboard.scoped.v1";
  * The pieces of state that are remembered per guard. Kept as a closed list so
  * `clearGuardScopedState` can enumerate what to remove on delete — an open-ended
  * key space could not be cleaned up without a full-storage scan.
+ *
+ * `eventMarks` (#482, #483) is here for the same reason the drafts are: a bookmark
+ * or a note belongs to the guard whose event it annotates, so deleting that guard
+ * has to take them with it.
  */
-export const SCOPED_STORAGE_BASES = ["feedFilter", "policyDraft"] as const;
+export const SCOPED_STORAGE_BASES = ["feedFilter", "policyDraft", "eventMarks"] as const;
 
 export type ScopedBase = (typeof SCOPED_STORAGE_BASES)[number];
 

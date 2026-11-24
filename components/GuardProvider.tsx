@@ -31,6 +31,7 @@ import { createServer } from "../lib/guard/chain.ts";
 import { readGuardSnapshot, type GuardSnapshot } from "../lib/guard/guardOps.ts";
 import { NETWORK } from "../lib/guard/network.ts";
 import { POLLING, jitteredInterval, startRefreshTimer } from "../lib/guard/polling.ts";
+import { refreshSources, type RefreshSource } from "../lib/guard/refreshStatus.ts";
 import {
   FEED_SWITCH_HISTORY_LEDGERS,
   GuardFeed,
@@ -399,6 +400,11 @@ export function GuardProvider({
   });
   const [snapshot, setSnapshot] = useState<GuardSnapshot | null>(null);
   const [snapshotError, setSnapshotError] = useState<string | null>(null);
+  // When the last snapshot read failed, kept apart from `snapshotError` because
+  // the text is cleared as the panel moves on (a guard switch, a retry) while the
+  // date is a fact about the transport. #528: an undated failure cannot be
+  // ordered against a later success, which is how recovery is detected.
+  const [snapshotFailureAt, setSnapshotFailureAt] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<number | null>(null);
   // Per-read retry state (issue #36): which single field is re-reading. Only
@@ -842,6 +848,7 @@ export function GuardProvider({
       // drop the previous snapshot rather than leaving stale numbers on screen.
       setSnapshot(null);
       setSnapshotError(error instanceof Error ? error.message : String(error));
+      setSnapshotFailureAt(new Date().toISOString());
     } finally {
       if (epoch === readEpochRef.current) setRefreshing(false);
     }
@@ -1554,6 +1561,80 @@ export function GuardProvider({
   const stream = useMemo(
     () => ({ paused, pendingCount, dropped }),
     [paused, pendingCount, dropped],
+  );
+
+  /**
+   * What this provider's two pollers tell the header strip about themselves (#528).
+   *
+   * Both readings come from state the panel below is already showing, never from a
+   * second read: the strip that exists to say whether the numbers on screen are
+   * current would be useless if it had its own idea of current.
+   *
+   * `lastSuccessAt` is keyed on the snapshot rather than on `lastRefresh` alone.
+   * A guard switch nulls the snapshot without nulling the stamp, and reporting the
+   * previous guard's read as this guard's freshness is the exact conflation of
+   * "we refreshed" with "this is what this guard says" that #311 and #528 exist to
+   * prevent. A success is a stamp that belongs to what is on screen.
+   */
+  const statusSource = useMemo<RefreshSource>(
+    () => ({
+      id: "status",
+      intervalMs: SNAPSHOT_INTERVAL_MS,
+      // The poller is on this screen whenever there is a guard to read.
+      watching: guard.length > 0,
+      polling: refreshing,
+      lastSuccessAt:
+        snapshot === null || lastRefresh === null ? null : new Date(lastRefresh).toISOString(),
+      // A round that is not in flight has no attempt stamp of its own; the
+      // failure below carries its own date, which is the only one needed.
+      lastAttemptAt: null,
+      lastFailureAt: snapshotFailureAt,
+      error: snapshotError,
+      deliveredInLastRound: snapshot === null ? 0 : 1,
+      paused: false,
+    }),
+    [guard, refreshing, snapshot, lastRefresh, snapshotFailureAt, snapshotError],
+  );
+
+  const telemetrySource = useMemo<RefreshSource>(
+    () => ({
+      id: "telemetry",
+      intervalMs: FEED_INTERVAL_MS,
+      watching: feed.watching,
+      polling: poll.polling,
+      lastSuccessAt: poll.lastSuccessAt,
+      lastAttemptAt: poll.lastAttemptAt,
+      lastFailureAt: poll.lastFailureAt,
+      error: poll.error,
+      deliveredInLastRound: poll.eventsInLastRound,
+      // The freeze stops rows moving, not the poll. Stated beside the phase for
+      // that reason: `watching` is still true while this is true.
+      paused: stream.paused,
+    }),
+    [feed.watching, poll, stream.paused],
+  );
+
+  // Publish, and stop publishing. Demo mode is the one case where this provider's
+  // timers are not chain reads at all - the snapshot is a fixture and the feed is
+  // a synthetic event generator - so both sources are withdrawn rather than
+  // dressed up, and the strip says nothing about data the chain never sent.
+  useEffect(() => {
+    if (demo) {
+      refreshSources.retire("status");
+      refreshSources.retire("telemetry");
+      return;
+    }
+    refreshSources.publish(statusSource);
+    refreshSources.publish(telemetrySource);
+  }, [demo, statusSource, telemetrySource]);
+
+  // The provider is per screen, so leaving on one must take its rows with it.
+  useEffect(
+    () => () => {
+      refreshSources.retire("status");
+      refreshSources.retire("telemetry");
+    },
+    [],
   );
 
   // Memoised so an `events` batch — the frequent update — cannot change this

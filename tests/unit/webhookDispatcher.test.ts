@@ -38,11 +38,16 @@ import {
   describeDispatch,
   dispatchWebhook,
   dueWebhookEvents,
+  getScopedGuardsForNetwork,
+  isGuardScopedForDelivery,
   isRateLimited,
   loadWebhookSettings,
+  normalizeScopedGuards,
   normalizeWebhookSettings,
+  sanitizeGuardLabel,
   saveWebhookSettings,
   serializeWebhookPayload,
+  setScopedGuardsForNetwork,
   signWebhookBody,
   subscribeWebhookSettings,
   validateWebhookUrl,
@@ -62,6 +67,7 @@ function settings(overrides: Partial<WebhookSettings> = {}): WebhookSettings {
     ...DEFAULT_WEBHOOK_SETTINGS,
     enabled: true,
     url: "https://hooks.example.com/guard",
+    scopedGuards: { testnet: [GUARD] },
     ...overrides,
   };
 }
@@ -898,5 +904,201 @@ describe("describeDispatch", () => {
     assert.match(result("network"), /address|network access/i);
     assert.notEqual(result("cors"), result("network"));
     assert.notEqual(result("timeout"), result("network"));
+  });
+});
+
+// ── Per-network guard scoping and safe attribution (issue #495) ─────────────
+
+describe("per-network guard scoping and safe attribution (issue #495)", () => {
+  const GUARD_A = "CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7";
+  const GUARD_B = "CB2M5YFEI74KVKZVES4UQNY3FLHMYE5R24EY2OSHB5LJH5FI2IJMSP5I";
+
+  describe("normalizeScopedGuards", () => {
+    test("normalizes network keys to lowercase and filters invalid contract addresses", () => {
+      const input = {
+        " TESTNET ": [
+          GUARD_A,
+          "not-a-contract",
+          GUARD_A,
+          "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7",
+        ],
+        MAINNET: [GUARD_B],
+        invalid: null,
+      };
+      const normalized = normalizeScopedGuards(input);
+      assert.deepEqual(normalized, {
+        testnet: [GUARD_A],
+        mainnet: [GUARD_B],
+      });
+    });
+
+    test("handles non-object and corrupted inputs safely", () => {
+      assert.deepEqual(normalizeScopedGuards(null), {});
+      assert.deepEqual(normalizeScopedGuards(undefined), {});
+      assert.deepEqual(normalizeScopedGuards("string"), {});
+      assert.deepEqual(normalizeScopedGuards(123), {});
+    });
+  });
+
+  describe("getScopedGuardsForNetwork and setScopedGuardsForNetwork", () => {
+    test("returns empty array when network is unconfigured", () => {
+      const s = { ...DEFAULT_WEBHOOK_SETTINGS };
+      assert.deepEqual(getScopedGuardsForNetwork(s, "testnet"), []);
+      assert.equal(isGuardScopedForDelivery(s, GUARD_A, "testnet"), false);
+    });
+
+    test("sets and gets scoped guards per network case-insensitively", () => {
+      const s1 = setScopedGuardsForNetwork({ ...DEFAULT_WEBHOOK_SETTINGS }, "Testnet", [GUARD_A]);
+      assert.deepEqual(getScopedGuardsForNetwork(s1, "TESTNET"), [GUARD_A]);
+      assert.equal(isGuardScopedForDelivery(s1, GUARD_A, "testnet"), true);
+      assert.equal(isGuardScopedForDelivery(s1, GUARD_B, "testnet"), false);
+
+      const s2 = setScopedGuardsForNetwork(s1, "mainnet", [GUARD_B]);
+      assert.deepEqual(getScopedGuardsForNetwork(s2, "testnet"), [GUARD_A]);
+      assert.deepEqual(getScopedGuardsForNetwork(s2, "mainnet"), [GUARD_B]);
+      // Scoping is strictly per-network: GUARD_A is scoped on testnet, but not on mainnet
+      assert.equal(isGuardScopedForDelivery(s2, GUARD_A, "mainnet"), false);
+      assert.equal(isGuardScopedForDelivery(s2, GUARD_B, "mainnet"), true);
+    });
+  });
+
+  describe("delivery scoping enforcement", () => {
+    test("defaults to no delivery until configured, even when webhooks are enabled", async () => {
+      const unconfigured = {
+        ...DEFAULT_WEBHOOK_SETTINGS,
+        enabled: true,
+        url: "https://hooks.example.com/guard",
+        scopedGuards: {},
+      };
+      const { fetch: stub, calls } = recordingFetch(() => ({ status: 200 }));
+      const p = buildWebhookPayload({
+        event: "FREEZE_ACTIVATED",
+        guard: GUARD_A,
+        network: "testnet",
+      });
+
+      const result = await dispatchWebhook(p, unconfigured, { fetch: stub });
+      assert.equal(result.ok, false);
+      assert.equal(result.outcome, "skipped");
+      assert.match(result.error ?? "", /not configured for webhook delivery/);
+      assert.equal(calls.length, 0);
+    });
+
+    test("skips delivery for an unselected guard on the same network", async () => {
+      const configuredForBOnly = settings({
+        scopedGuards: { testnet: [GUARD_B] },
+      });
+      const { fetch: stub, calls } = recordingFetch(() => ({ status: 200 }));
+      const p = buildWebhookPayload({
+        event: "FREEZE_ACTIVATED",
+        guard: GUARD_A,
+        network: "testnet",
+      });
+
+      const result = await dispatchWebhook(p, configuredForBOnly, { fetch: stub });
+      assert.equal(result.ok, false);
+      assert.equal(result.outcome, "skipped");
+      assert.equal(calls.length, 0);
+    });
+
+    test("delivers successfully when the guard is explicitly scoped", async () => {
+      const configuredForA = settings({
+        scopedGuards: { testnet: [GUARD_A] },
+      });
+      const { fetch: stub, calls } = recordingFetch(() => ({ status: 200 }));
+      const p = buildWebhookPayload({
+        event: "FREEZE_ACTIVATED",
+        guard: GUARD_A,
+        network: "testnet",
+      });
+
+      const result = await dispatchWebhook(p, configuredForA, { fetch: stub });
+      assert.equal(result.ok, true);
+      assert.equal(result.outcome, "sent");
+      assert.equal(calls.length, 1);
+    });
+
+    test("dueWebhookEvents returns empty list when guard is not scoped for network", () => {
+      const s = settings({ scopedGuards: { testnet: [GUARD_B] } });
+      const due = dueWebhookEvents({
+        settings: s,
+        events: ["FREEZE_ACTIVATED"],
+        guard: GUARD_A,
+        network: "testnet",
+        nowMs: 1000,
+      });
+      assert.deepEqual(due, []);
+    });
+
+    test("dueWebhookEvents returns events when guard is scoped", () => {
+      const s = settings({ scopedGuards: { testnet: [GUARD_A] } });
+      const due = dueWebhookEvents({
+        settings: s,
+        events: ["FREEZE_ACTIVATED"],
+        guard: GUARD_A,
+        network: "testnet",
+        nowMs: 1000,
+      });
+      assert.deepEqual(due, ["FREEZE_ACTIVATED"]);
+    });
+
+    test("verification ping bypasses guard scoping check", async () => {
+      const unconfigured = {
+        ...DEFAULT_WEBHOOK_SETTINGS,
+        enabled: true,
+        url: "https://hooks.example.com/guard",
+        scopedGuards: {},
+      };
+      const { fetch: stub, calls } = recordingFetch(() => ({ status: 200 }));
+      const ping = buildVerificationPing({ guard: GUARD_A, network: "testnet" });
+
+      const result = await dispatchWebhook(ping, unconfigured, { fetch: stub });
+      assert.equal(result.ok, true);
+      assert.equal(result.outcome, "sent");
+      assert.equal(calls.length, 1);
+    });
+  });
+
+  describe("safe guard attribution", () => {
+    test("scrubs secret keys pasted into guard labels", () => {
+      const secret = "SB367YUSQIZI4R5P6KCV4K3W4G4L5WOCQ2MVTZQ27C24G2NQLQ6XJ5G3";
+      const dirty = `Production Guard (${secret})`;
+      const safe = sanitizeGuardLabel(dirty, GUARD_A);
+      assert.doesNotMatch(safe, new RegExp(secret));
+      assert.equal(safe, `Guard ${GUARD_A.slice(0, 6)}…${GUARD_A.slice(-4)}`);
+    });
+
+    test("strips control and invisible format characters", () => {
+      const dirty = "Guard\u200B \u00ADAlpha\u202E";
+      const safe = sanitizeGuardLabel(dirty, GUARD_A);
+      assert.equal(safe, "Guard Alpha");
+    });
+
+    test("clamps label length and falls back deterministically for empty label", () => {
+      const huge = "A".repeat(200);
+      const safeHuge = sanitizeGuardLabel(huge, GUARD_A);
+      assert.equal(safeHuge.length, 100);
+
+      const empty = sanitizeGuardLabel("   ", GUARD_A);
+      assert.equal(empty, `Guard ${GUARD_A.slice(0, 6)}…${GUARD_A.slice(-4)}`);
+    });
+
+    test("buildWebhookPayload and buildVerificationPing include safe guardLabel", () => {
+      const p = buildWebhookPayload({
+        event: "FREEZE_ACTIVATED",
+        guard: GUARD_A,
+        network: "testnet",
+        guardLabel: "  Workload-Alpha  ",
+      });
+      assert.equal(p.guardLabel, "Workload-Alpha");
+      assert.equal(p.guard, GUARD_A);
+
+      const ping = buildVerificationPing({
+        guard: GUARD_A,
+        network: "testnet",
+        guardLabel: "Staging Guard",
+      });
+      assert.equal(ping.guardLabel, "Staging Guard");
+    });
   });
 });

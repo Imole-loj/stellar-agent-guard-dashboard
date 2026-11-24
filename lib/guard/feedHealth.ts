@@ -29,7 +29,7 @@
  * reading of state the caller already has, so it can be exercised without RPC.
  */
 
-import { formatTimeAgo } from "./time.ts";
+import { formatTimeAgo, sinceWords } from "./time.ts";
 
 /** How many poll intervals of silence make a watching feed overdue. */
 export const OVERDUE_INTERVALS = 3;
@@ -42,6 +42,23 @@ export const OVERDUE_INTERVALS = 3;
  * `overdue`    — watching, but no successful round has landed inside the window.
  */
 export type PollPhase = "off" | "pending" | "healthy" | "failing" | "overdue";
+
+/**
+ * The phase in as few words as a header pill has room for. Short, and never the
+ * same word twice: "polling" used to cover both a live feed and a stuck one,
+ * which is the conflation #311 is about.
+ *
+ * Exported because two surfaces state it — the feed's own pill and the console
+ * header's refresh strip (#528) — and a phase that reads "polling" on one and
+ * "live" on the other is the same bug wearing two shirts.
+ */
+export const POLL_PHASE_WORDS: Record<PollPhase, string> = {
+  off: "stopped",
+  pending: "connecting",
+  healthy: "polling",
+  failing: "poll failing",
+  overdue: "no response",
+};
 
 export interface PollHealthInput {
   watching: boolean;
@@ -96,19 +113,6 @@ function toMs(iso: string | null): number | null {
 
 /** The wording used whenever a feed is not watching, shared by both producers. */
 export const POLL_OFF_TEXT = "Not watching this feed. No events are being polled.";
-
-/**
- * "5s ago", "2m ago" — or "just now".
- *
- * `formatTimeAgo` already spells the sub-ten-second case as the phrase "just
- * now", so appending " ago" to it produces "just now ago". The rounding is the
- * helper's; only the suffix is guarded here, because every sentence below reads
- * better without a second copy of that rule.
- */
-function sinceWords(thenMs: number, nowMs: number): string {
-  const phrase = formatTimeAgo(Math.floor(thenMs / 1000), Math.floor(nowMs / 1000));
-  return phrase === "just now" ? "just now" : `${phrase} ago`;
-}
 
 /**
  * The health of a feed that is not polling: the initial client state and the

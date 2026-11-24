@@ -34,6 +34,20 @@ export function formatTimeAgo(
 }
 
 /**
+ * "5s ago", "2m ago" — or "just now".
+ *
+ * `formatTimeAgo` already spells the sub-ten-second case "just now", so plain
+ * concatenation says "just now ago". The suffix is guarded in one place because
+ * three panels say how long ago something happened, and a stale clock that
+ * reads differently in the header than in a panel is read as two different
+ * clocks rather than one lie.
+ */
+export function sinceWords(thenMs: number, nowMs: number): string {
+  const phrase = formatTimeAgo(Math.floor(thenMs / 1000), Math.floor(nowMs / 1000));
+  return phrase === "just now" ? "just now" : `${phrase} ago`;
+}
+
+/**
  * One instant rendered two ways, so a timestamp cannot be misread across
  * teams in different time zones (issue #387).
  *

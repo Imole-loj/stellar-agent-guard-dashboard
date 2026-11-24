@@ -69,6 +69,7 @@ export const URL_TABS = [
   "panic",
   "status",
   "txhistory",
+  "incident",
   "telemetry",
   "multisig",
   "xdr",

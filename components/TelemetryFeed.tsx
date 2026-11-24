@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { describeGuardEvent, explainReason, GUARD_EVENT_TOPICS } from "stellar-agent-guard-sdk";
 import type { GuardEvent } from "stellar-agent-guard-sdk";
 import {
@@ -26,8 +26,25 @@ import { loadScopedValue, saveScopedValue } from "../lib/guard/guardScoped.ts";
 import { useAnnounce } from "../lib/guard/useAnnounce.ts";
 import { eventsToCsv, eventsToJson, exportFilename } from "../lib/guard/eventExport.ts";
 import { buildExportScope, describeExportScope } from "../lib/guard/exportScope.ts";
-import type { PollPhase } from "../lib/guard/feedHealth.ts";
-import { streamPaused, streamResumed } from "../lib/guard/announceCopy.ts";
+import { POLL_PHASE_WORDS, type PollPhase } from "../lib/guard/feedHealth.ts";
+import {
+  markNotStored,
+  markRejected,
+  markRemoved,
+  markSaved,
+  streamPaused,
+  streamResumed,
+  type MarkKind,
+} from "../lib/guard/announceCopy.ts";
+import {
+  EVENT_NOTE_MAX_LENGTH,
+  MARKS_ARE_BROWSER_LOCAL,
+  eventIdentityOf,
+  eventMarks,
+  sameMark,
+  type EventMark,
+  type MarkPatch,
+} from "../lib/guard/eventMarks.ts";
 import { BlockedEventBadge } from "./BlockedEventBadge.tsx";
 import { useDemoMode } from "../lib/guard/useDemoMode.ts";
 import {
@@ -41,6 +58,8 @@ import {
 import { severityFor } from "../lib/guard/feedSeverity.ts";
 import { formatEventTimestamp } from "../lib/guard/time.ts";
 import { decodeUrlState, writeUrlState } from "../lib/guard/urlState.ts";
+import { eventHref, eventLinkTargetFor, writeEventLink } from "../lib/guard/eventLink.ts";
+import { EventDetailPanel } from "./EventDetailPanel.tsx";
 import {
   FEED_GUARD_CAP,
   attributionLabel,
@@ -50,19 +69,6 @@ import {
 
 /** The scoped-state base under which each guard's feed filter is remembered. */
 const SCOPED_FILTER_BASE = "feedFilter";
-
-/**
- * The header pill wording for each poll phase (#311). Short, and never the same
- * word twice: "polling" covered both a live feed and a stuck one before, which is
- * the conflation this issue is about.
- */
-const HEALTH_LABELS: Record<PollPhase, string> = {
-  off: "stopped",
-  pending: "connecting",
-  healthy: "polling",
-  failing: "poll failing",
-  overdue: "no response",
-};
 
 /** Human names for the topic filter's options, keyed by the topic symbol. */
 const TOPIC_LABELS: Record<string, string> = {
@@ -182,6 +188,39 @@ export function TelemetryFeed() {
   const announce = useAnnounce();
   const demo = useDemoMode();
 
+  /*
+    Operator marks (#482, #483): the bookmark and the note held against each event.
+
+    One subscription at the panel rather than one per row. Rows are memoised and the
+    feed holds up to `STREAM_BUFFER_LIMIT` of them, so a per-row subscription would
+    mean a hundred listeners re-rendering on every keystroke-sized write, and the
+    panel needs the same reading anyway for its counts, its "bookmarked only"
+    control and the storage notice. `markFor()` is a cache read, so a row still
+    renders only the one mark it owns.
+
+    `observe()` is called from an effect, never during render: reading this browser's
+    storage in the render that hydrates server markup is the mismatch this store's
+    `getServerSnapshot` exists to avoid, and it is the same rule `fleetTableState.ts`
+    states for the fleet table.
+  */
+  useSyncExternalStore(eventMarks.subscribe, eventMarks.getSnapshot, eventMarks.getServerSnapshot);
+  // Every guard that has an event in the buffer, not just the guard on screen: a
+  // bookmark made against guard A must still show when the operator is looking at
+  // a merged tail of A and B, and it must not be applied to a same-looking event id
+  // under guard B. The bucket is chosen from the event's own contract.
+  const markedGuards = useMemo(() => {
+    const seen = new Set<string>();
+    for (const event of events) {
+      const identity = eventIdentityOf(event);
+      if (identity !== null) seen.add(identity.guard);
+    }
+    return [...seen];
+  }, [events]);
+
+  useEffect(() => {
+    eventMarks.observe(markedGuards);
+  }, [markedGuards]);
+
   /**
    * Download the feed through the shared export path (issue #37). The schema,
    * BOM and filename rules all live in `lib/guard/eventExport.ts` — this is a
@@ -215,16 +254,45 @@ export function TelemetryFeed() {
   // of the verdict/topic/contract filter rather than instead of it: an empty
   // selection means "every guard", which is the state the panel opens in.
   const [selectedGuards, setSelectedGuards] = useState<Set<string>>(() => new Set());
+  // "Bookmarked only" (#482) is a *view* control, ephemeral like the guard chips:
+  // it selects which saved rows to show, it is not a property of the event and so
+  // it is not part of the persisted `TelemetryFilter` a filter-sharing link can
+  // carry. Bookmarking is per-browser; a URL that promised "bookmarked only" would
+  // be a promise about rows the recipient has never marked.
+  const [bookmarkedOnly, setBookmarkedOnly] = useState(false);
   const guardVisible = useMemo(
     () => events.filter((event) => matchesGuardFilter(event.contractId, selectedGuards)),
     [events, selectedGuards],
   );
-  // The three controls and the exports all act on the same projection, so a
-  // CSV/NDJSON download is provably the filtered view on screen — one row in,
-  // one line out, never a hidden superset. The guard chip feeds that same
-  // projection, so an export is the filtered multi-guard view and nothing more.
-  const rows = filterGuardEvents(guardVisible, filter);
-  const filterActive = isFilterActive(filter) || selectedGuards.size > 0;
+  // The three controls, the bookmark view and the exports all act on the same
+  // projection, so a CSV/NDJSON download is provably the filtered view on screen —
+  // one row in, one line out, never a hidden superset. The guard chip feeds that
+  // same projection, so an export is the filtered multi-guard view and nothing
+  // more. A bookmark narrows it the same way, and the export preview above the
+  // table counts exactly what it left out.
+  const byFilter = filterGuardEvents(guardVisible, filter);
+  const rows = bookmarkedOnly
+    ? byFilter.filter((event) => eventMarks.markFor(event)?.bookmarked === true)
+    : byFilter;
+  const filterActive = isFilterActive(filter) || selectedGuards.size > 0 || bookmarkedOnly;
+
+  /*
+    Two counts, because they answer different questions and conflating them is how
+    a saved mark comes to look lost: `marksStored` is everything this browser holds
+    for the guards in view, `marksInBuffer` is the subset sitting on events the feed
+    still displays. The buffer is capped, so a bookmark on an event that scrolled
+    out is saved and simply not showable here — the panel says so rather than
+    letting the operator conclude it was deleted.
+  */
+  const marksStored = markedGuards.reduce(
+    (total, address) => total + Object.keys(eventMarks.marksOf(address)).length,
+    0,
+  );
+  const marksInBuffer = events.reduce(
+    (total, event) => (eventMarks.markFor(event) === null ? total : total + 1),
+    0,
+  );
+  const marksNotice = eventMarks.notice();
 
   /**
    * The scope every download leaves with (#309), computed from the same rows the
@@ -316,13 +384,54 @@ export function TelemetryFeed() {
     announce(spoken.message, spoken.priority);
   }
 
+  /**
+   * Write one half of a mark, then say what happened in the words `announceCopy`
+   * owns (#482, #483).
+   *
+   * Returns the sentence a *rejection* produced, or `null`. The row keeps it to put
+   * beside the textarea that caused it: a note editor must not close on a note it
+   * did not save, or the operator loses what they typed. A mark that was applied but
+   * not stored is deliberately not returned — it is on the row and the editor has
+   * nothing left to fix, so the panel's storage notice carries that one instead.
+   *
+   * Stable across renders, which is what lets the memoised row take it as a prop
+   * without defeating its own memoisation.
+   */
+  const applyMark = useCallback(
+    (event: GuardEvent, patch: MarkPatch, kind: MarkKind): string | null => {
+      const before = eventMarks.markFor(event);
+      const outcome = eventMarks.applyMark(event, patch);
+      const anchored = eventIdentityOf(event)?.anchored ?? false;
+      if (outcome.ok && sameMark(before, outcome.mark)) {
+        // Nothing on the row changed, so nothing is worth interrupting the operator
+        // for — and "Note removed" for a note that never existed is not true.
+        return null;
+      }
+      const spoken = !outcome.ok
+        ? markRejected(kind, outcome.message)
+        : outcome.mark === null
+          ? markRemoved(kind)
+          : outcome.persisted
+            ? markSaved(kind, anchored)
+            : markNotStored(
+                kind,
+                eventMarks.notice()?.message ?? "the browser refused to write it",
+              );
+      announce(spoken.message, spoken.priority);
+      return outcome.ok ? null : spoken.message;
+    },
+    [announce],
+  );
+
   return (
     <div className="panel">
       <div className="row" style={{ justifyContent: "space-between" }}>
         <h2 style={{ margin: 0 }}>Telemetry</h2>
         <div className="row">
           {feed.watching && (
-            <span className={`pill ${feed.health.tone}`}>{HEALTH_LABELS[feed.health.phase]}</span>
+            <span className={`pill ${feed.health.tone}`}>
+              {POLL_PHASE_WORDS[feed.health.phase]}
+            </span>
           )}
           {stream.paused && <span className="pill warn">paused</span>}
           {/* Counted from the buffer, not from the rows on screen: a paused,
@@ -373,6 +482,11 @@ export function TelemetryFeed() {
           </button>
         </div>
       </div>
+
+      {/* Focus from `?event=…`, above the controls rather than below the table: an
+          operator arriving from a shared link came for that one row, and the feed
+          they land on is empty until someone presses Start watching. */}
+      <EventDetailPanel />
 
       <div style={{ marginTop: 10 }}>
         <DateRangePicker onApply={applyRange} />
@@ -518,8 +632,10 @@ export function TelemetryFeed() {
             className="secondary"
             onClick={() => {
               applyFilter(() => EMPTY_TELEMETRY_FILTER);
-              // "Clear filters" clears every criterion, the chip filter included.
+              // "Clear filters" clears every criterion, the chip filter and the
+              // bookmark view included.
               setSelectedGuards(new Set());
+              setBookmarkedOnly(false);
             }}
           >
             Clear filters
@@ -559,6 +675,50 @@ export function TelemetryFeed() {
         </div>
       )}
 
+      {/*
+        What this browser holds in marks (#482, #483), stated once for the whole
+        feed instead of per row.
+
+        It renders only while something is marked, or while the view is filtered to
+        marks. That is the honest condition — there is nothing to report about marks
+        that do not exist — and it is also why the console's visual baselines are
+        untouched by this feature: a fresh browser, which is what a baseline is
+        taken in, renders the panel exactly as it did before. The entry point is the
+        per-row control, not this block.
+
+        The two counts are kept apart because conflating them is how a saved mark
+        comes to look deleted. The buffer is capped, so a mark on an event that has
+        aged out is still stored and simply has no row to sit on here.
+      */}
+      {(marksStored > 0 || bookmarkedOnly) && (
+        <div style={{ marginTop: 8 }} data-testid="marks-panel">
+          <label
+            className="tiny muted"
+            style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+          >
+            <input
+              type="checkbox"
+              checked={bookmarkedOnly}
+              onChange={(event) => setBookmarkedOnly(event.target.checked)}
+            />
+            Bookmarked only ({marksInBuffer} in view)
+          </label>
+          <p className="tiny muted" style={{ marginTop: 4 }}>
+            {marksStored} operator mark{marksStored === 1 ? "" : "s"} saved in this browser for{" "}
+            {markedGuards.length} guard{markedGuards.length === 1 ? "" : "s"}; {marksInBuffer} of{" "}
+            {marksStored} sit on events this feed still holds, and the rest are on events that have
+            aged out of the buffer — saved, not lost. {MARKS_ARE_BROWSER_LOCAL} They are never part
+            of an export, a transaction or a webhook payload.
+          </p>
+          {marksNotice !== null && (
+            <div className="notice" role="status" data-testid="marks-storage-notice">
+              <strong>Marks in this browser could not be read</strong>
+              <span className="tiny">{marksNotice.message}</span>
+            </div>
+          )}
+        </div>
+      )}
+
       <p className="tiny muted" style={{ marginTop: 8 }}>
         Tailed from Soroban RPC&apos;s <code>getEvents</code> with a cursor, so no event is
         delivered twice and none is skipped between polls. Soroban has no push stream — the floor on
@@ -579,7 +739,7 @@ export function TelemetryFeed() {
         feed whose every poll since the first had failed.
       */}
       <p className="tiny muted" style={{ marginTop: 4 }} aria-label="Telemetry poll health">
-        <span className={`pill ${feed.health.tone}`}>{HEALTH_LABELS[feed.health.phase]}</span>{" "}
+        <span className={`pill ${feed.health.tone}`}>{POLL_PHASE_WORDS[feed.health.phase]}</span>{" "}
         {feed.health.text}
         {feed.lastPolledAt && feed.lastPolledAt !== feed.health.lastSuccessAt && (
           <>
@@ -752,8 +912,9 @@ export function TelemetryFeed() {
       ) : rows.length === 0 ? (
         <p className="tiny muted">
           No events match the current filter. The feed still holds {guardVisible.length} event(s);
-          widen the verdict, topic, contract{selectedGuards.size > 0 ? " or guard" : ""} filter to
-          see them.
+          widen the verdict, topic, contract
+          {selectedGuards.size > 0 ? ", guard" : ""}
+          {bookmarkedOnly ? " or bookmark" : ""} filter to see them.
         </p>
       ) : (
         <div className="scrolly table-stack">
@@ -765,6 +926,8 @@ export function TelemetryFeed() {
                   key={event.id}
                   event={event}
                   guardLabel={attributionLabel(event.contractId, chipSources)}
+                  mark={eventMarks.markFor(event)}
+                  onMark={applyMark}
                 />
               ))}
             </tbody>
@@ -805,23 +968,76 @@ export function TelemetryFeed() {
  * Severity rides here, on the row's own attributes, so the tier costs no extra
  * element and the cells stay exactly as they were — O(1) from fields the decoder
  * already produced, with no topic or reason string parsed (see `severityFor`).
+ *
+ * Since #482/#483 the row also renders its operator mark, and that is the one
+ * thing here which is not a function of `event` alone. It arrives as a prop for
+ * exactly that reason: the panel subscribes to the marks store once, and a row
+ * takes the single `EventMark` it displays. The memo still holds, because the
+ * store hands out identity-stable mark objects (only the one that changed is
+ * replaced) and `onMark` is a `useCallback`, so bookmarking one row re-renders
+ * that row and leaves the other 249 alone. A per-row subscription would have
+ * meant one listener per row and a re-render of the whole table per keystroke.
  */
 const TelemetryRow = memo(function TelemetryRow({
   event,
   guardLabel,
+  mark,
+  onMark,
 }: {
   event: TelemetryEvent;
   /** The registry label for this row's guard, resolved by the caller. */
   guardLabel: string | null;
+  /** This row's operator mark, or `null`. Read from the store by the panel. */
+  mark: EventMark | null;
+  /** Apply one half of the mark; returns a rejection's wording, or `null`. */
+  onMark: (event: GuardEvent, patch: MarkPatch, kind: MarkKind) => string | null;
 }) {
+  // The note editor is row-local on purpose: a draft belongs to the row being
+  // annotated, it must not survive a remount of a different row, and lifting it
+  // to the panel would re-render all 250 rows on every keystroke.
+  const [editingNote, setEditingNote] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [noteError, setNoteError] = useState<string | null>(null);
+
+  function openNoteEditor(): void {
+    setDraft(mark?.note ?? "");
+    setNoteError(null);
+    setEditingNote(true);
+  }
+
+  function closeNoteEditor(): void {
+    setEditingNote(false);
+    setDraft("");
+    setNoteError(null);
+  }
+
+  function saveNote(): void {
+    const rejected = onMark(event, { note: draft }, "note");
+    // Only a refusal keeps the editor open: closing it on an unsaved note would
+    // discard what the operator just typed.
+    if (rejected === null) closeNoteEditor();
+    else setNoteError(rejected);
+  }
+
   const severity = severityFor(event);
   const iso = event.ledgerClosedAt ?? event.observedAt ?? null;
+  // Derived from the row's own event, so the permalink costs no new prop and the
+  // memoisation above stays exactly as it was. Null for a refusal and for a row the
+  // console could not address, and those rows render no affordance rather than a
+  // link that would fail to re-read (see `eventLinkTargetFor`).
+  const focus = eventLinkTargetFor(event);
+  const href = focus === null ? null : eventHref(focus.guard, focus.raw);
+  const permalink = focus !== null && href !== null ? { locator: focus.raw, href } : null;
   // Both renderings of the same instant: the local wall time with an explicit
   // zone label for at-a-glance reading, and the stable UTC value to quote in a
   // report. The UTC value comes from the parsed instant, so it is unaffected
   // by this operator's zone or by DST; invalid timestamps yield null and the
   // cell falls back to the relative time plus `—`.
   const timestamp = formatEventTimestamp(iso);
+  // Whether this row can hold a mark at all: no emitting contract, or a diagnostic
+  // that arrived without the SDK's content-hashed id, and there is nothing to key
+  // one on (`eventIdentityOf` is what the store itself refuses on).
+  const rowIdentity = eventIdentityOf(event);
   return (
     <tr className={`severity-${severity}`} data-severity={severity} data-stream={event.source}>
       <td data-label="Event">
@@ -830,6 +1046,105 @@ const TelemetryRow = memo(function TelemetryRow({
         <span className="visually-hidden">Severity: {severity}. </span>
         <div>{labelFor(event)}</div>
         <div className="tiny muted mono">{describeGuardEvent(event)}</div>
+        {permalink !== null && (
+          <a
+            className="tiny"
+            href={permalink.href}
+            data-testid="event-permalink"
+            title="Focus this event. Opens a detail re-read from the chain, and puts a link to this exact row in the address bar."
+            onClick={(click) => {
+              // Plain navigation would reload the page and take the feed, the
+              // wallet session and any form draft with it. `replaceState` focuses
+              // the row in place; a modified click (new tab) still navigates.
+              if (click.metaKey || click.ctrlKey || click.shiftKey || click.altKey) return;
+              click.preventDefault();
+              writeEventLink(permalink.locator);
+            }}
+          >
+            link to this row
+          </a>
+        )}
+        {/*
+          The operator's own marks (#482, #483).
+
+          Both controls are offered on every row the feed can identify, marked or
+          not: a bookmark is how a mark comes to exist, so an affordance that only
+          appeared once the first one did would be undiscoverable. A row with no
+          stable identity shows the reason instead of a button, because the refusal
+          it would produce is otherwise something only a screen reader hears. What
+          is *not* offered on any row is a re-read promise — a bookmarked
+          diagnostic says "no ledger to re-read this from" rather than linking to a
+          ledger that never held it.
+        */}
+        {rowIdentity === null ? (
+          <div className="tiny muted" data-testid="mark-unavailable" style={{ marginTop: 4 }}>
+            <span
+              className="pill"
+              title="A mark is keyed on the event's own id. This row never carried one and has no ledger entry to reconstruct it from, so a bookmark would attach to the wrong event or to none."
+            >
+              unidentifiable
+            </span>{" "}
+            nothing to save a mark against
+          </div>
+        ) : (
+          <div className="row" style={{ gap: 6, marginTop: 4, flexWrap: "wrap" }}>
+            <button
+              className="secondary"
+              aria-pressed={mark?.bookmarked ?? false}
+              title="Bookmark this event in this browser. A bookmark is yours, not the guard's, and no export carries it."
+              onClick={() =>
+                onMark(event, { bookmarked: !(mark?.bookmarked ?? false) }, "bookmark")
+              }
+            >
+              {mark?.bookmarked ? "Bookmarked" : "Bookmark"}
+            </button>
+            <button
+              className="secondary"
+              onClick={() => (editingNote ? closeNoteEditor() : openNoteEditor())}
+              title="Add a private note about this event, stored in this browser only."
+            >
+              {editingNote ? "Close note" : mark?.note ? "Edit note" : "Note"}
+            </button>
+          </div>
+        )}
+        {mark !== null && (
+          <div className="tiny muted" data-testid="mark-indicator" style={{ marginTop: 2 }}>
+            <span className="pill warn" title={MARKS_ARE_BROWSER_LOCAL}>
+              browser-local
+            </span>{" "}
+            {mark.bookmarked ? "bookmarked" : "noted"}
+            {mark.note !== "" && <>: {mark.note}</>}
+          </div>
+        )}
+        {editingNote && (
+          <div style={{ marginTop: 4 }}>
+            <textarea
+              aria-label="Note for this event, stored in this browser only"
+              className="tiny"
+              rows={2}
+              maxLength={EVENT_NOTE_MAX_LENGTH}
+              value={draft}
+              onChange={(change) => setDraft(change.target.value)}
+              style={{ width: "100%", boxSizing: "border-box" }}
+            />
+            <div className="row" style={{ gap: 6, marginTop: 4, flexWrap: "wrap" }}>
+              <button onClick={saveNote}>Save note</button>
+              <button className="secondary" onClick={closeNoteEditor}>
+                Cancel
+              </button>
+            </div>
+            <p className="tiny muted" style={{ marginTop: 2 }}>
+              {draft.length}/{EVENT_NOTE_MAX_LENGTH} characters. Saving an empty note removes it.
+              Stored in this browser only: never exported, never sent to the network, never part of
+              a transaction.
+            </p>
+            {noteError !== null && (
+              <p className="tiny" role="alert" data-testid="note-error">
+                {noteError}
+              </p>
+            )}
+          </div>
+        )}
       </td>
       <td data-label="Decision">
         {event.decision ? (

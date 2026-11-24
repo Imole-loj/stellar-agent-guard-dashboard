@@ -22,6 +22,7 @@ import { GuardEventsContext, useGuard } from "./GuardProvider.tsx";
 import { evaluateDmsAlert } from "../lib/guard/dmsAlert.ts";
 import type { TelemetryEvent } from "../lib/guard/telemetry.ts";
 import { NETWORK } from "../lib/guard/network.ts";
+import { defaultGuardLabel } from "../lib/guard/instance.ts";
 import { announce } from "../lib/guard/useAnnounce.ts";
 import {
   buildWebhookPayload,
@@ -29,6 +30,7 @@ import {
   createWebhookTriggerTracker,
   dispatchWebhook,
   dueWebhookEvents,
+  isGuardScopedForDelivery,
   loadWebhookSettings,
   subscribeWebhookSettings,
   webhookEventsFor,
@@ -46,7 +48,7 @@ import {
 const NO_EVENTS: readonly TelemetryEvent[] = [];
 
 export function WebhookAlertBridge() {
-  const { snapshot, guard } = useGuard();
+  const { snapshot, guard, activeInstance } = useGuard();
   // Read through the context directly rather than `useGuardEvents`, which throws
   // outside a provider: the feed is an input to one of three conditions, and a
   // missing feed is a missing *input*, not a reason to fail rendering. An absent
@@ -84,6 +86,7 @@ export function WebhookAlertBridge() {
   useEffect(() => {
     const settings = settingsRef.current;
     if (settings === null || !settings.enabled) return;
+    if (!isGuardScopedForDelivery(settings, guard, NETWORK.name)) return;
     // Two dispatches for the same event cannot race: the tracker has already
     // consumed this edge, so the next pass sees the condition as unchanged and
     // produces nothing to send.
@@ -105,6 +108,8 @@ export function WebhookAlertBridge() {
     const due = dueWebhookEvents({
       settings,
       events: webhookEventsFor(settings, conditions),
+      guard,
+      network: NETWORK.name,
       lastSentAt: lastSentAt.current,
       nowMs: now,
     });
@@ -117,6 +122,7 @@ export function WebhookAlertBridge() {
           event,
           guard,
           network: NETWORK.name,
+          guardLabel: activeInstance?.label ?? defaultGuardLabel(guard),
           timestamp: new Date(now).toISOString(),
           details: buildDetails(event, conditions),
         },
@@ -141,7 +147,7 @@ export function WebhookAlertBridge() {
           // running either way.
         });
     }
-  }, [snapshot, events, guard, tracker]);
+  }, [snapshot, events, guard, tracker, activeInstance?.label]);
 
   return null;
 }

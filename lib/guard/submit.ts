@@ -41,9 +41,11 @@ import {
   recordWriteInterruption,
   recoveryGuidance,
   revalidateWallet,
+  setPendingWrite,
   type WriteInterruption,
   type WritePhase,
 } from "./writeReview.ts";
+import { WalletRefusedError, WalletUserRejectedError } from "./walletConnector.ts";
 
 /** Inclusion fee floor, in stroops, for a single-operation transaction. */
 // `FeePreset` is imported as a type on purpose: `scripts/prove-phase3.ts` runs
@@ -530,6 +532,7 @@ export async function writeBoundary(
  * simulation.
  */
 async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
+  setPendingWrite("discovery");
   const passphrase = request.passphrase ?? NETWORK.passphrase;
   const { server, signer } = request;
 
@@ -642,6 +645,7 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
     // administrators since the simulation must not sign this review (issue #340).
     const beforeAuth = await writeBoundary(signer, "authorization");
     if (beforeAuth) return beforeAuth;
+    setPendingWrite("authorization");
     promptWallet();
     let signedEntryXdr: string;
     try {
@@ -651,6 +655,15 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
       if (interruption) {
         announce("Wallet interrupted during authorization signing — nothing was resubmitted");
         return interruptedResult(interruption.interruption);
+      }
+      if (isWalletRefusal(error)) {
+        announce("Transaction refused — nothing was broadcast");
+        return {
+          kind: "refused",
+          stage: "wallet",
+          detail: (error as Error).message,
+          diagnosticEvents: [],
+        };
       }
       // A decline is the operator's decision, not a failure: when the caller
       // asked for it (deploy/initialize, issue #291) it gets its own outcome so
@@ -738,6 +751,7 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
   // the silent source switch this check exists to prevent.
   const beforeEnvelope = await writeBoundary(signer, "envelope");
   if (beforeEnvelope) return beforeEnvelope;
+  setPendingWrite("envelope");
   promptWallet();
   let signedEnvelope: string;
   try {
@@ -747,6 +761,15 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
     if (interruption) {
       announce("Wallet interrupted during transaction signing — nothing was resubmitted");
       return interruptedResult(interruption.interruption);
+    }
+    if (isWalletRefusal(error)) {
+      announce("Transaction refused — nothing was broadcast");
+      return {
+        kind: "refused",
+        stage: "wallet",
+        detail: (error as Error).message,
+        diagnosticEvents: [],
+      };
     }
     // Same at the envelope as at the authorization entry: where the caller asked
     // for it, the operator saying no ends the write as a cancellation that never
@@ -775,6 +798,7 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
   const beforeSend = await writeBoundary(signer, "submission");
   if (beforeSend) return beforeSend;
 
+  setPendingWrite("submission");
   let sent: rpc.Api.SendTransactionResponse;
   try {
     sent = await server.sendTransaction(transaction);
@@ -785,6 +809,9 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
       detail: `the network refused the transaction: ${stringifyError(error)}`,
       diagnosticEvents: [],
     };
+  }
+  if (sent && (sent as any).hash) {
+    setPendingWrite("submission", (sent as any).hash);
   }
   if (sent.status === "ERROR") {
     return {
@@ -849,55 +876,59 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
  * not recorded: a refusal never had a transaction to record.
  */
 export async function invokeWithWallet(request: InvokeRequest): Promise<InvokeResult> {
-  const result = await runInvocation(request);
-  const context = `for guard ${request.contract}`;
-  if (result.kind === "exported") {
-    announce(`Transaction XDR exported for offline signing ${context}`);
-  } else if (result.kind === "refused" && result.writeInterruption) {
-    // The provider went away or the account changed mid-write. The guidance is
-    // phase-specific and already on screen; the announcement says which phase,
-    // and deliberately does not claim the write failed — at submission time it
-    // may have landed.
-    const guidance = recoveryGuidance(result.writeInterruption);
-    announce(`${guidance.headline} ${guidance.nextStep}`, "assertive");
-  } else if (result.kind === "cancelled") {
-    // The operator's own decision, so the announcement says what did *not*
-    // happen and that nothing needs rescuing — no transaction exists to look up.
-    announce("Signing declined in the wallet — nothing was broadcast", "assertive");
-  } else if (result.kind === "refused") {
-    announce(`Transaction refused — nothing was broadcast ${context}`, "assertive");
-  } else if (result.kind === "failed") {
-    recordTx({
-      hash: result.hash,
-      operation: request.fn,
-      status: "failed",
-      feeStroops: result.feeStroops ?? null,
-      networkName: NETWORK.name,
-      networkPassphrase: request.passphrase ?? NETWORK.passphrase,
-    });
-    announce(`Transaction failed on chain ${context}`, "assertive");
-  } else if (result.kind === "submitted") {
-    recordTx({
-      hash: result.hash,
-      operation: request.fn,
-      status: "confirmed",
-      feeStroops: result.feeStroops ?? null,
-      networkName: NETWORK.name,
-      networkPassphrase: request.passphrase ?? NETWORK.passphrase,
-    });
-    announce(
-      result.ledger !== null && result.status === rpc.Api.GetTransactionStatus.SUCCESS
-        ? `Transaction confirmed on ledger ${result.ledger} ${context}`
-        : `Transaction confirmed on the network ${context}`,
-    );
-    // Only the transaction is announced here, never what the operator meant by
-    // it. A freeze's *effect* is claimed by whoever can verify it: the panic
-    // panel, which re-reads `status()` and announces "Account frozen" or the
-    // reason it did not take, and the fleet table, which has no re-read and so
-    // announces the submission itself. One announcement per write, from the
-    // place that has the evidence for it.
+  try {
+    const result = await runInvocation(request);
+    const context = `for guard ${request.contract}`;
+    if (result.kind === "exported") {
+      announce(`Transaction XDR exported for offline signing ${context}`);
+    } else if (result.kind === "refused" && result.writeInterruption) {
+      // The provider went away or the account changed mid-write. The guidance is
+      // phase-specific and already on screen; the announcement says which phase,
+      // and deliberately does not claim the write failed — at submission time it
+      // may have landed.
+      const guidance = recoveryGuidance(result.writeInterruption);
+      announce(`${guidance.headline} ${guidance.nextStep}`, "assertive");
+    } else if (result.kind === "cancelled") {
+      // The operator's own decision, so the announcement says what did *not*
+      // happen and that nothing needs rescuing — no transaction exists to look up.
+      announce("Signing declined in the wallet — nothing was broadcast", "assertive");
+    } else if (result.kind === "refused") {
+      announce(`Transaction refused — nothing was broadcast ${context}`, "assertive");
+    } else if (result.kind === "failed") {
+      recordTx({
+        hash: result.hash,
+        operation: request.fn,
+        status: "failed",
+        feeStroops: result.feeStroops ?? null,
+        networkName: NETWORK.name,
+        networkPassphrase: request.passphrase ?? NETWORK.passphrase,
+      });
+      announce(`Transaction failed on chain ${context}`, "assertive");
+    } else if (result.kind === "submitted") {
+      recordTx({
+        hash: result.hash,
+        operation: request.fn,
+        status: "confirmed",
+        feeStroops: result.feeStroops ?? null,
+        networkName: NETWORK.name,
+        networkPassphrase: request.passphrase ?? NETWORK.passphrase,
+      });
+      announce(
+        result.ledger !== null && result.status === rpc.Api.GetTransactionStatus.SUCCESS
+          ? `Transaction confirmed on ledger ${result.ledger} ${context}`
+          : `Transaction confirmed on the network ${context}`,
+      );
+      // Only the transaction is announced here, never what the operator meant by
+      // it. A freeze's *effect* is claimed by whoever can verify it: the panic
+      // panel, which re-reads `status()` and announces "Account frozen" or the
+      // reason it did not take, and the fleet table, which has no re-read and so
+      // announces the submission itself. One announcement per write, from the
+      // place that has the evidence for it.
+    }
+    return result;
+  } finally {
+    setPendingWrite(null);
   }
-  return result;
 }
 
 /**
@@ -949,7 +980,21 @@ export function isWalletCancellation(error: unknown): boolean {
   }
   const message = error instanceof Error ? error.message : String(error);
   const normalised = message.toLowerCase();
-  return /reject|denied|declin|cancel|abort|user.*(close|dismiss)/.test(normalised);
+  return /user.*(reject|cancel|abort|close|dismiss|decline)|cancel|abort/.test(normalised);
+}
+
+export function isWalletRefusal(error: unknown): boolean {
+  if (!error) return false;
+  if (typeof error === "object" && (error as any).name === "WalletRefusedError") {
+    return true;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  const normalised = message.toLowerCase();
+  // Do not classify explicit user cancellations as provider refusals
+  if (/user.*(reject|cancel|abort|close|dismiss|decline)|cancel|abort/.test(normalised)) {
+    return false;
+  }
+  return /refus|denied|unauthori|forbidden|policy violation|not permitted/.test(normalised);
 }
 
 export function actionableCancellationMessage(error: unknown): string {

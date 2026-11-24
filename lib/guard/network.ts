@@ -12,7 +12,17 @@ import { GUARD_WASM_HASH } from "stellar-agent-guard-sdk";
  * instance to read the pinned bytes from — and those default to public testnet.
  */
 
-import type { RpcHealthFailure, RpcHealthResult } from "../rpc/timeouts.ts";
+import type { RpcHealthFailure, RpcHealthResult, RpcProbeOptions } from "../rpc/timeouts.ts";
+import {
+  DIAGNOSTIC_REDACTED,
+  RPC_PROBE_TIMEOUT_MS,
+  buildReadDiagnostic,
+  redactDiagnosticText,
+  sanitizeEndpointOrigin,
+} from "../rpc/timeouts.ts";
+
+export { DIAGNOSTIC_REDACTED, sanitizeEndpointOrigin, redactDiagnosticText, buildReadDiagnostic };
+export type { ReadDiagnostic } from "../rpc/timeouts.ts";
 
 /**
  * The canonical public Stellar testnet: the defaults, and the network the pinned
@@ -156,5 +166,192 @@ export function describeRpcHealth(result: RpcHealthResult): RpcHealthCopy {
     tone: "warn",
     label: `unreachable · ${result.latencyMs} ms`,
     headline: headline[result.failure],
+  };
+}
+
+// ── Centralized endpoint redaction (#507) ────────────────────────────────
+
+/**
+ * Redact userinfo credentials (passwords/tokens) and query-string parameter values from an endpoint URL.
+ *
+ * Covers embedded credentials in `http(s)://user:pass@host` and query tokens `?token=...&apiKey=...`.
+ * Malformed or non-URL strings are safely sanitized with regex token redaction without throwing.
+ */
+export function redactEndpointUrl(endpoint: string): string {
+  if (!endpoint || typeof endpoint !== "string") return "";
+  return String(endpoint)
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@]*@/gi, `$1${DIAGNOSTIC_REDACTED}@`)
+    .replace(/([?&][^=\s&#]+)=[^\s&#]*/g, `$1=${DIAGNOSTIC_REDACTED}`);
+}
+
+/**
+ * Return an endpoint string suitable for clipboard copy actions, guaranteed to have all credentials redacted.
+ */
+export function safeCopyEndpoint(endpoint: string): string {
+  return redactEndpointUrl(endpoint);
+}
+
+// ── Read-only endpoint probing (#506) ────────────────────────────────────
+
+export interface ReadOnlyProbeSuccess {
+  ok: true;
+  endpointOrigin: string;
+  latencyMs: number;
+  passphrase: string;
+  protocolVersion: number;
+  networkName: string;
+}
+
+export interface ReadOnlyProbeFailure {
+  ok: false;
+  endpointOrigin: string;
+  latencyMs: number;
+  failure: "timeout" | "malformed" | "unavailable" | "network";
+  detail: string;
+}
+
+export type ReadOnlyProbeResult = ReadOnlyProbeSuccess | ReadOnlyProbeFailure;
+
+export function resolveNetworkNameFromPassphrase(passphrase: string): string {
+  const p = (passphrase ?? "").trim();
+  if (p === TESTNET.passphrase) return "Testnet";
+  if (p === "Public Global Stellar Network ; September 2015") return "Mainnet";
+  if (p === "Test SDF Future Network ; October 2022") return "Futurenet";
+  if (p.toLowerCase().includes("standalone") || p.toLowerCase().includes("local"))
+    return "Standalone";
+  return p ? "Custom Network" : "Unknown Network";
+}
+
+/**
+ * Probe a documented read endpoint (`getNetwork`) to verify reachability, latency, and network identity.
+ *
+ * This operation is strictly read-only and non-custodial:
+ * - It queries Soroban RPC JSON-RPC `getNetwork`.
+ * - It never signs, submits, or persists anything as chain state.
+ * - Round-trip latency is timed and network identity (passphrase and protocol version) is extracted.
+ * - Credentials in the endpoint URL or error message are strictly redacted.
+ */
+export async function probeReadOnlyEndpoint(
+  endpoint: string,
+  options: RpcProbeOptions = {},
+): Promise<ReadOnlyProbeResult> {
+  const endpointOrigin = sanitizeEndpointOrigin(endpoint);
+  const timeoutMs = options.timeoutMs ?? RPC_PROBE_TIMEOUT_MS;
+  const now = options.now ?? Date.now;
+  const doFetch: typeof fetch =
+    options.fetchImpl ?? ((input, init) => globalThis.fetch(input, init));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const started = now();
+  const elapsed = (): number => Math.max(0, now() - started);
+
+  try {
+    const response = await doFetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getNetwork" }),
+      signal: controller.signal,
+    });
+    const latencyMs = elapsed();
+    if (!response.ok) {
+      return {
+        ok: false,
+        endpointOrigin,
+        latencyMs,
+        failure: "unavailable",
+        detail: `the endpoint answered HTTP ${response.status}`,
+      };
+    }
+    const payload: any = await response.json().catch(() => null);
+    if (!payload || typeof payload !== "object") {
+      return {
+        ok: false,
+        endpointOrigin,
+        latencyMs,
+        failure: "malformed",
+        detail: "the endpoint answered, but not with valid JSON",
+      };
+    }
+    if (payload.error) {
+      return {
+        ok: false,
+        endpointOrigin,
+        latencyMs,
+        failure: "malformed",
+        detail: redactDiagnosticText(String(payload.error.message ?? "RPC error")),
+      };
+    }
+    const result = payload.result;
+    if (!result || typeof result !== "object" || typeof result.passphrase !== "string") {
+      return {
+        ok: false,
+        endpointOrigin,
+        latencyMs,
+        failure: "malformed",
+        detail: "the endpoint answered, but not with a valid getNetwork result",
+      };
+    }
+
+    const passphrase = result.passphrase;
+    const protocolVersion = Number(result.protocolVersion ?? 0);
+    const networkName = resolveNetworkNameFromPassphrase(passphrase);
+
+    return {
+      ok: true,
+      endpointOrigin,
+      latencyMs,
+      passphrase,
+      protocolVersion,
+      networkName,
+    };
+  } catch (error) {
+    if (controller.signal.aborted) {
+      return {
+        ok: false,
+        endpointOrigin,
+        latencyMs: elapsed(),
+        failure: "timeout",
+        detail: `no answer within ${timeoutMs}ms`,
+      };
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      endpointOrigin,
+      latencyMs: elapsed(),
+      failure: "network",
+      detail: redactDiagnosticText(message),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ── Endpoint setting roles explanation (#508) ───────────────────────────
+
+export const ENDPOINT_ROLES = {
+  readOnly: {
+    role: "Read-Only RPC Endpoint",
+    description:
+      "Used exclusively for non-custodial queries: telemetry feeds, guard status inspection, " +
+      "simulation, and ledger event verification. It holds no keys, cannot authorize transactions, " +
+      "and consumes no network fees.",
+  },
+  writeNetwork: {
+    role: "Write Network (Wallet Network)",
+    description:
+      "The network domain where your connected wallet (e.g., Freighter) signs and broadcasts transactions " +
+      "(deployments, policy updates, emergency freeze). Changing the read endpoint does not alter the " +
+      "wallet's write network or signature destination.",
+  },
+} as const;
+
+export function explainEndpointRoles(): {
+  readOnlyRole: string;
+  writeRole: string;
+} {
+  return {
+    readOnlyRole: ENDPOINT_ROLES.readOnly.description,
+    writeRole: ENDPOINT_ROLES.writeNetwork.description,
   };
 }

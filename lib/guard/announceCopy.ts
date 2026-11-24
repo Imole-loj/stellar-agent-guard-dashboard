@@ -108,6 +108,28 @@ function withGuard(spoken: Spoken, guard?: string): Spoken {
   return guard ? { ...spoken, message: `${spoken.message} for guard ${guard}` } : spoken;
 }
 
+/**
+ * Which half of an operator's mark they just touched (#482, #483).
+ *
+ * One record, two controls: a bookmark says "come back to this row" and a note says
+ * "here is what I think about it". They are announced separately because the two
+ * operators' intents differ, and a single "mark saved" would leave a note's author
+ * unable to tell whether the text or the flag took.
+ */
+export type MarkKind = "bookmark" | "note";
+
+/** A mark that was written, phrased as what was written. */
+const MARK_SAVED: Record<MarkKind, string> = {
+  bookmark: "Bookmarked in this browser",
+  note: "Note saved in this browser",
+};
+
+/** The mark as a sentence start, so a failure reads as a sentence. */
+const MARK_HEAD: Record<MarkKind, string> = {
+  bookmark: "Bookmark",
+  note: "Note",
+};
+
 /** The feed's table was frozen while polling carried on behind it. */
 export function streamPaused(): Spoken {
   return {
@@ -124,6 +146,56 @@ export function streamResumed(added: number): Spoken {
         ? "Stream resumed; no events were queued"
         : `Stream resumed with ${added} queued event${added === 1 ? "" : "s"}`,
     priority: "polite",
+  };
+}
+
+/**
+ * A mark was written to this browser.
+ *
+ * Polite — the operator asked for it, and it changes nothing on chain. The wording
+ * carries "in this browser" deliberately: #483's risk is a note being remembered as
+ * something the guard recorded, so the sentence that confirms the save is the one
+ * that says where it lives.
+ *
+ * `anchored: false` is the #482 distinction. A diagnostic row has no transaction and
+ * no ledger, so unlike a committed row it cannot be re-read later — the bookmark is
+ * a memory, not a pointer, and the operator is told that at the moment they make it
+ * rather than when they come back and find nothing to open.
+ */
+export function markSaved(kind: MarkKind, anchored = true): Spoken {
+  const message = MARK_SAVED[kind];
+  return {
+    message: anchored ? message : `${message}; this row has no ledger to re-read it from`,
+    priority: "polite",
+  };
+}
+
+/** The mark, or the last half of it, was deleted. */
+export function markRemoved(kind: MarkKind): Spoken {
+  return { message: `${MARK_HEAD[kind]} removed`, priority: "polite" };
+}
+
+/**
+ * Nothing was written, and why. `reason` is the store's own diagnostic — the note
+ * held a secret key, the row had no stable identity, or the guard's list is full.
+ *
+ * Assertive per rule 1 above: "not saved" on its own is strictly less than what the
+ * sighted operator reads, and the reason is the part that says what to do next.
+ */
+export function markRejected(kind: MarkKind, reason: string): Spoken {
+  return { message: `${MARK_HEAD[kind]} was not saved: ${reason}`, priority: "assertive" };
+}
+
+/**
+ * The mark is live this session but was not written to storage, because the browser
+ * refused the write. Distinct from a rejection: the operator's bookmark *is* on the
+ * row and the "bookmarked only" filter will find it — it simply will not survive a
+ * reload, which is a promise the panel must not quietly drop.
+ */
+export function markNotStored(kind: MarkKind, reason: string): Spoken {
+  return {
+    message: `${MARK_HEAD[kind]} not stored in this browser: ${reason}`,
+    priority: "assertive",
   };
 }
 

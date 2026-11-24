@@ -9,6 +9,7 @@ import { TxHistoryTable } from "../components/TxHistoryTable.tsx";
 import { TelemetryFeed } from "../components/TelemetryFeed.tsx";
 import { MultisigTracker } from "../components/MultisigTracker.tsx";
 import { PanicPanel } from "../components/PanicPanel.tsx";
+import { IncidentPanel } from "../components/IncidentPanel.tsx";
 import { HardwareWalletGuide } from "../components/HardwareWalletGuide.tsx";
 import { DashboardGrid, type GridPanel } from "../components/DashboardGrid.tsx";
 import { ScopeNotice } from "../components/bits.tsx";
@@ -24,6 +25,9 @@ const PANELS: GridPanel[] = [
   { id: "status", title: "On-chain state", content: <StatusPanel /> },
   { id: "txhistory", title: "Transaction history", content: <TxHistoryTable /> },
   { id: "panic", title: "Emergency", content: <PanicPanel /> },
+  // Directly after Emergency because it hands off to it: its freeze and unfreeze
+  // rows move focus to the controls above rather than repeating them (#527).
+  { id: "incident", title: "Incident actions", content: <IncidentPanel /> },
   { id: "telemetry", title: "Telemetry", content: <TelemetryFeed /> },
   { id: "multisig", title: "Multisig approvals", content: <MultisigTracker /> },
   { id: "xdr", title: "Submit Signed XDR", content: <SubmitSignedXDRPanel /> },

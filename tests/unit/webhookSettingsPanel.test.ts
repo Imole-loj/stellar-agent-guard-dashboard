@@ -182,3 +182,44 @@ describe("the test-send headline never claims more than the outcome knows (#315)
     }
   });
 });
+
+describe("guard scoping in webhook settings modal (issue #495)", () => {
+  it("renders scoped guards section and default hint when no guards are selected", async () => {
+    const dialog = await mountDialog();
+    const section = dialog.container.querySelector('[data-testid="webhook-scoped-guards"]');
+    assert.ok(section, "dialog renders scoped guards section");
+    const hint = dialog.container.querySelector('[data-testid="webhook-no-guards-hint"]');
+    assert.ok(hint, "dialog displays default-to-no-delivery hint when unselected");
+    assert.match(hint.textContent ?? "", /default to no delivery/i);
+  });
+
+  it("toggling a guard checkbox updates scopedGuards in saved settings", async () => {
+    const dialog = await mountDialog();
+    const section = dialog.container.querySelector('[data-testid="webhook-scoped-guards"]');
+    assert.ok(section);
+    const checkbox = section.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    assert.ok(checkbox, "renders a checkbox for the available guard");
+    assert.equal(checkbox.checked, false, "starts unchecked (default to no delivery)");
+
+    await act(async () => {
+      checkbox.click();
+      await sleep(0);
+    });
+    assert.equal(checkbox.checked, true, "becomes checked after click");
+
+    // Click Save button
+    const saveButton = Array.from(dialog.container.querySelectorAll("button")).find((entry) =>
+      /^Save$/.test((entry.textContent ?? "").trim()),
+    );
+    assert.ok(saveButton);
+    await act(async () => {
+      saveButton.click();
+      await sleep(0);
+    });
+
+    const saved = JSON.parse(window.localStorage.getItem(WEBHOOK_SETTINGS_STORAGE_KEY) ?? "{}");
+    assert.ok(saved.scopedGuards, "persists scopedGuards map");
+    const testnetGuards = saved.scopedGuards.testnet ?? [];
+    assert.ok(testnetGuards.includes(GUARD), "GUARD is saved in scopedGuards for testnet");
+  });
+});

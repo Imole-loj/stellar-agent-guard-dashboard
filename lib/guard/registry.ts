@@ -334,3 +334,127 @@ export function fallbackAfterRemoval(params: {
   if (saved.some((instance) => instance.guard === activeGuard)) return null;
   return saved[0]?.guard ?? defaultGuard;
 }
+
+// ── Guarded Local Registry Merge Preview (Issue #479) ──────────────────────
+
+export interface RegistryMergeCandidate {
+  guard: string;
+  label: string;
+  network: string;
+}
+
+export interface RegistryConflict {
+  guard: string;
+  currentLabel: string;
+  importedLabel: string;
+  currentNetwork: string;
+  importedNetwork: string;
+}
+
+export interface RegistryMergePreview {
+  ok: boolean;
+  error?: string;
+  additions: RegistryMergeCandidate[];
+  conflicts: RegistryConflict[];
+  skips: { guard: string; reason: string }[];
+  invalid: { input: unknown; reason: string }[];
+}
+
+/**
+ * Preview local registry merge before changing local data (Issue #479).
+ *
+ * Checks incoming items for:
+ * - Invalid addresses or malformed schemas (captured without corrupting registry)
+ * - Identical duplicates (skipped)
+ * - Conflicts (same address with different label or network, requiring confirmation)
+ * - Additions (new valid instances)
+ *
+ * Pure: makes zero writes to storage. On cancel or invalid input, registry is unchanged.
+ */
+export function previewRegistryMerge(
+  currentInstances: readonly GuardInstance[],
+  importedData: unknown,
+  activeNetwork: string = NETWORK.name,
+): RegistryMergePreview {
+  if (typeof importedData !== "object" || importedData === null) {
+    return {
+      ok: false,
+      error: "Import data must be a JSON array or object containing instances.",
+      additions: [],
+      conflicts: [],
+      skips: [],
+      invalid: [],
+    };
+  }
+
+  let items: unknown[] = [];
+  if (Array.isArray(importedData)) {
+    items = importedData;
+  } else if (Array.isArray((importedData as { instances?: unknown }).instances)) {
+    items = (importedData as { instances: unknown[] }).instances;
+  } else if (Array.isArray((importedData as { entries?: unknown }).entries)) {
+    items = (importedData as { entries: unknown[] }).entries;
+  } else {
+    return {
+      ok: false,
+      error: "Import JSON must contain an array of guard instances.",
+      additions: [],
+      conflicts: [],
+      skips: [],
+      invalid: [],
+    };
+  }
+
+  const additions: RegistryMergeCandidate[] = [];
+  const conflicts: RegistryConflict[] = [];
+  const skips: { guard: string; reason: string }[] = [];
+  const invalid: { input: unknown; reason: string }[] = [];
+  const seenInBatch = new Set<string>();
+
+  for (const item of items) {
+    if (typeof item !== "object" || item === null) {
+      invalid.push({ input: item, reason: "Item is not an object" });
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const rawAddress = String(record.guard || record.address || "").trim();
+    const rawLabel = String(record.label || record.name || defaultGuardLabel(rawAddress)).trim();
+    const network = String(record.network || activeNetwork).trim();
+
+    if (!isValidGuardAddress(rawAddress)) {
+      invalid.push({ input: item, reason: `Invalid Soroban contract address: ${rawAddress}` });
+      continue;
+    }
+
+    if (seenInBatch.has(rawAddress)) {
+      skips.push({ guard: rawAddress, reason: "Duplicate entry within imported batch" });
+      continue;
+    }
+    seenInBatch.add(rawAddress);
+
+    const existing = currentInstances.find((inst) => inst.guard === rawAddress);
+    if (!existing) {
+      additions.push({ guard: rawAddress, label: rawLabel, network });
+    } else {
+      if (existing.label === rawLabel && existing.network === network) {
+        skips.push({ guard: rawAddress, reason: "Identical guard already exists in registry" });
+      } else {
+        conflicts.push({
+          guard: rawAddress,
+          currentLabel: existing.label,
+          importedLabel: rawLabel,
+          currentNetwork: existing.network,
+          importedNetwork: network,
+        });
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    additions,
+    conflicts,
+    skips,
+    invalid,
+  };
+}
